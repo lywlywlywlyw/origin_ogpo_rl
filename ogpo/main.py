@@ -26,6 +26,7 @@ from ogpo.utils.main_helper import (
     process_train_dataset,
     get_q_bounds,
     setup_experiment_logging,
+    training_log_prefixes,
 )
 from ogpo.runners.bc_runner import (
     run_bc_training,
@@ -318,17 +319,12 @@ def main():
         print(f"Multi-GPU ({gpu_mode}): {num_mesh_devices} devices, "
               f"{agent_config['batch_size'] // num_mesh_devices} samples/device")
 
-    prefixes = ["eval", "env", "offline_agent", "memory"]
-    online_steps = train_config["online_steps"]
-    bc_only = train_config["bc_only"]
-    if online_steps > 0 and not bc_only:
-        prefixes.append("online_agent")
-    if algo_name in ["ogpo", "reinflow_calql"]:
-        prefixes.extend(["eval_sde", "step_data"])
-    if agent_config.get('use_one_step_policy', False):
-        prefixes.append("eval_one_step")
-    if train_config.get("q_warmup_steps", 0) > 0 and not bc_only:
-        prefixes.append("q_warmup")
+    online_steps = train_config['online_steps']
+    bc_only = train_config['bc_only']
+    prefixes = training_log_prefixes(
+        algo_name, online_steps, bc_only,
+        agent_config.get('use_one_step_policy', False),
+        train_config.get('q_warmup_steps', 0))
 
     run_name = exp_config["run_name"]
     save_dir, logger, wandb_run_id = setup_experiment_logging(
@@ -348,25 +344,34 @@ def main():
     resumed_step = 0
     resumed_online_step = 0
     resumed_buffer = None
-    try:
-        (
-            resumed_agent,
-            resumed_buffer,
-            resumed_step,
-            resumed_online_step,
-            resumed_wandb_id,
-        ) = load_rolling_checkpoint(seed, env_name, agent, algo_name)
-        if resumed_agent is not None:
-            agent = resumed_agent
-            if mesh is not None:
-                agent = shard_agent(agent, mesh)
-            is_resumed = True
-            print(f"Resumed from step {resumed_step}")
-    except Exception as e:
-        print(f"Could not load checkpoint: {e}")
-        resumed_buffer = None
+    if checkpoint_config.get('resume', True):
+        try:
+            (
+                resumed_agent,
+                resumed_buffer,
+                resumed_step,
+                resumed_online_step,
+                resumed_wandb_id,
+            ) = load_rolling_checkpoint(seed, env_name, agent, algo_name)
+            if resumed_agent is not None:
+                agent = resumed_agent
+                if mesh is not None:
+                    agent = shard_agent(agent, mesh)
+                is_resumed = True
+                print(f"Resumed from step {resumed_step}")
+        except Exception as e:
+            print(f"Could not load checkpoint: {e}")
+            resumed_buffer = None
 
     # Restore pre-trained weights
+    flow_path = checkpoint_config.get('restore_bc_flow_path')
+    if not is_resumed and flow_path:
+        if algo_name != 'dsrl':
+            raise ValueError('restore_bc_flow_path currently supports only dsrl')
+        if train_config['bc_pi_steps'] != 0:
+            raise ValueError('Shared frozen BC flow requires training.bc_pi_steps=0')
+        agent = agent.restore_bc_flow_params(flow_path)
+
     if not is_resumed:
         restore_actor_path = checkpoint_config["restore_actor_path"]
         restore_critic_path = checkpoint_config["restore_critic_path"]

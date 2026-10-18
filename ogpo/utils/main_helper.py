@@ -325,6 +325,23 @@ def create_success_buffer_batch(
     )
     return success_batch
 
+def training_log_prefixes(algo_name, online_steps, bc_only=False,
+                          use_one_step_policy=False, q_warmup_steps=0):
+    """CSV namespaces shared by training setup and its integration tests."""
+    prefixes = ['eval', 'env', 'offline_agent', 'memory']
+    if online_steps > 0 and not bc_only:
+        prefixes.append('online_agent')
+        if algo_name in ('dsrl', 'dsrl_bon', 'dsrl_plus_expo'):
+            prefixes.append('online_budget')
+    if algo_name in ('ogpo', 'reinflow_calql'):
+        prefixes.extend(['eval_sde', 'step_data'])
+    if use_one_step_policy:
+        prefixes.append('eval_one_step')
+    if q_warmup_steps > 0 and not bc_only:
+        prefixes.append('q_warmup')
+    return prefixes
+
+
 def setup_experiment_logging(
     seed: int,
     project: str,
@@ -361,7 +378,8 @@ def setup_experiment_logging(
     if log_enabled:
         # Reuse the wandb run ID from an existing checkpoint, if any.
         checkpoint_wandb_id = None
-        if checkpoint_dir_fn is not None:
+        resume_enabled = (config or {}).get('checkpoint', {}).get('resume', True)
+        if checkpoint_dir_fn is not None and resume_enabled:
             try:
                 checkpoint_dir = checkpoint_dir_fn(seed, env_name)
                 if os.path.exists(checkpoint_dir):

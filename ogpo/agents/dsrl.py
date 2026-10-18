@@ -56,11 +56,11 @@ class DSRLBestOfNAgent(flax.struct.PyTreeNode):
         if self.config['entropy_backup']:
             next_log_probs = jnp.clip(next_log_probs, -100, 100)
             target_q = batch['rewards'] + \
-                (self.config['discount'] ** self.config['horizon_length']) * batch['masks'] * \
+                (self.config['discount'] ** batch.get('chunk_length', self.config['horizon_length'])) * batch['masks'] * \
                 (next_q - temp * next_log_probs)
         else:
             target_q = batch['rewards'] + \
-                (self.config['discount'] ** self.config['horizon_length']) * batch['masks'] * next_q
+                (self.config['discount'] ** batch.get('chunk_length', self.config['horizon_length'])) * batch['masks'] * next_q
 
         target_q = jnp.clip(target_q, -500.0, 500.0)
 
@@ -181,6 +181,22 @@ class DSRLBestOfNAgent(flax.struct.PyTreeNode):
         network.params[f'modules_target_{module_name}'] = new_target_params
 
     @staticmethod
+    def _extra_critic_update(agent, batch, success_batch, success_flag, rng):
+        fixed_extra = agent.config.get('critic_updates_per_actor', 1) == 2
+        if not fixed_extra and not agent.config.get('use_success_buffer_q', False):
+            return agent
+        if success_batch is None:
+            success_batch = batch
+        chosen = jax.lax.cond(success_flag, lambda: success_batch, lambda: batch)
+        def update(current):
+            def loss_fn(p):
+                return current.critic_total_loss(chosen, p, rng)
+            state, _ = current.critic_network.apply_loss_fn(loss_fn)
+            current.target_update(state, 'critic')
+            return current.replace(critic_network=state)
+        return jax.lax.cond(jnp.logical_or(fixed_extra, success_flag), update, lambda a: a, agent)
+
+    @staticmethod
     def _update(agent, batch: dict) -> Tuple['DSRLBestOfNAgent', dict]:
         new_rng, rng1, rng2 = jax.random.split(agent.rng, 3)
 
@@ -193,9 +209,10 @@ class DSRLBestOfNAgent(flax.struct.PyTreeNode):
         new_critic_state, critic_info = agent.critic_network.apply_loss_fn(critic_loss_fn)
         agent.target_update(new_critic_state, 'critic')
 
-        return agent.replace(
-            actor_network=new_actor_state, critic_network=new_critic_state, rng=new_rng,
-        ), {**actor_info, **critic_info}
+        agent = agent.replace(
+            actor_network=new_actor_state, critic_network=new_critic_state, rng=new_rng)
+        agent = agent._extra_critic_update(agent, batch, None, False, jax.random.fold_in(rng2, 1))
+        return agent, {**actor_info, **critic_info}
 
     @staticmethod
     def _update_offline(agent, batch: dict) -> Tuple['DSRLBestOfNAgent', dict]:
@@ -239,9 +256,10 @@ class DSRLBestOfNAgent(flax.struct.PyTreeNode):
         new_critic_state, critic_info = agent.critic_network.apply_loss_fn(critic_loss_fn)
         agent.target_update(new_critic_state, 'critic')
 
-        return agent.replace(
-            actor_network=new_actor_state, critic_network=new_critic_state, rng=new_rng,
-        ), {**actor_info, **critic_info}
+        agent = agent.replace(
+            actor_network=new_actor_state, critic_network=new_critic_state, rng=new_rng)
+        agent = agent._extra_critic_update(agent, batch, batch_success, success_flag, rng3)
+        return agent, {**actor_info, **critic_info}
 
     @jax.jit
     def batch_update(self, batch, batch_success=None, success_flag=False):
@@ -342,6 +360,34 @@ class DSRLBestOfNAgent(flax.struct.PyTreeNode):
     def restore_critic_params(self, critic_path):
         _restore_critic_params(self.critic_network, critic_path)
 
+    def restore_bc_flow_params(self, checkpoint_path):
+        """Import an OGPO BC actor (or DSRL decoder) without its RL states."""
+        import pickle
+        import numpy as np
+
+        with open(checkpoint_path, 'rb') as f:
+            saved = pickle.load(f)['agent']
+        if 'bc_flow_network' in saved:
+            source = saved['bc_flow_network']['params']['modules_actor_bc_flow']
+        else:
+            source = saved['actor_network']['params']['modules_actor']
+        target = self.bc_flow_network.params['modules_actor_bc_flow']
+        source_leaves, source_tree = jax.tree_util.tree_flatten(source)
+        target_leaves, target_tree = jax.tree_util.tree_flatten(target)
+        if source_tree != target_tree or any(
+            np.shape(a) != np.shape(b) for a, b in zip(source_leaves, target_leaves)
+        ):
+            raise ValueError('BC flow checkpoint structure/shapes do not match the DSRL decoder')
+        if not all(np.isfinite(x).all() for x in source_leaves):
+            raise ValueError('BC flow checkpoint contains non-finite parameters')
+        params = dict(self.bc_flow_network.params)
+        params['modules_actor_bc_flow'] = jax.tree.map(jnp.asarray, source)
+        # This is weight initialization, not a resume of the offline optimizer.
+        state = self.bc_flow_network.replace(
+            params=params, opt_state=self.bc_flow_network.tx.init(params))
+        print(f'Restored frozen BC flow from {checkpoint_path}')
+        return self.replace(bc_flow_network=state)
+
     def restore_actor_params(self, actor_path):
         import pickle
         with open(actor_path, 'rb') as f:
@@ -369,6 +415,8 @@ class DSRLBestOfNAgent(flax.struct.PyTreeNode):
 
     @classmethod
     def create(cls, seed, ex_observations, ex_actions, config):
+        if config.get('critic_updates_per_actor', 1) not in (1, 2):
+            raise ValueError('critic_updates_per_actor must be 1 or 2')
         rng = jax.random.PRNGKey(seed)
         rng, init_rng = jax.random.split(rng, 2)
 
@@ -485,11 +533,11 @@ class DSRLBestOfNAgent(flax.struct.PyTreeNode):
 
         clip_norm = float(config.get('clip_grad_norm', 1000.0))
 
-        def get_optimizer(lr, opt_type):
+        def get_optimizer(lr, opt_type, weight_decay=1e-4):
             if opt_type == 'adam':
                 base = optax.adam(learning_rate=lr)
             elif opt_type == 'adamw':
-                base = optax.adamw(learning_rate=lr)
+                base = optax.adamw(learning_rate=lr, weight_decay=weight_decay)
             elif opt_type == 'sgd':
                 base = optax.sgd(learning_rate=lr)
             else:
@@ -497,7 +545,7 @@ class DSRLBestOfNAgent(flax.struct.PyTreeNode):
             return optax.chain(optax.clip_by_global_norm(clip_norm), base)
 
         actor_tx = get_optimizer(actor_lr, actor_opt_type)
-        critic_tx = get_optimizer(critic_lr, critic_opt_type)
+        critic_tx = get_optimizer(critic_lr, critic_opt_type, config.get('critic_weight_decay', 1e-4))
         bc_flow_tx = get_optimizer(bc_flow_lr, bc_flow_opt_type)
 
         rng, actor_rng, critic_rng, bc_flow_rng = jax.random.split(rng, 4)

@@ -7,6 +7,9 @@ _base_: common.yaml
 
 agent:
   agent_name: dsrl
+  # Legacy runs count UTD per action chunk. Enable for matched env-step budgets.
+  updates_per_env_step: false
+  chunk_reward_aggregation: max
 
   # DSRL-specific learning rates
   lr_actor: 3e-4

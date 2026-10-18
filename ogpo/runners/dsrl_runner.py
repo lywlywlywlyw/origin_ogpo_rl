@@ -58,6 +58,15 @@ def _reshape_for_utd(batch, utd_ratio, batch_size):
     return jax.tree.map(lambda x: x.reshape((utd_ratio, batch_size) + x.shape[1:]), batch)
 
 
+def _sample_success_chunks(replay_buffer, batch_size):
+    """Sample with replacement, like OGPO sample_sequence(success_only=True)."""
+    candidates = np.flatnonzero(replay_buffer._traj_success_mask[:replay_buffer.size])
+    if not len(candidates):
+        raise ValueError('No successful transitions available')
+    indices = replay_buffer.numpy_rng.choice(candidates, size=batch_size, replace=True)
+    return replay_buffer.sample(batch_size, idxs=indices)
+
+
 def run_dsrl_online_rl(
     agent: Any,
     env: Any,
@@ -125,6 +134,15 @@ def run_dsrl_online_rl(
     else:
         noise_dim = action_dim * noise_chunk_length
 
+    per_env_updates = config.get('updates_per_env_step', False)
+    if per_env_updates and any(u is not None and u != utd_online for u in (utd_q, utd_pi)):
+        raise ValueError('DSRL matched budget requires equal actor/critic UTD')
+    reward_aggregation = config.get('chunk_reward_aggregation', 'max')
+    if per_env_updates and reward_aggregation != 'discounted_sum':
+        raise ValueError('Matched env-step budget requires discounted_sum rewards/chunk lengths')
+    if reward_aggregation not in ('max', 'discounted_sum'):
+        raise ValueError(f'Unknown chunk reward aggregation: {reward_aggregation}')
+
     is_dsrl_expo = (algo_name == 'dsrl_plus_expo')
 
     if is_resumed and resumed_replay_buffer is not None:
@@ -142,6 +160,8 @@ def run_dsrl_online_rl(
             masks=np.array(1.0),
             next_observations=example_batch['observations'],
         )
+        if reward_aggregation == 'discounted_sum':
+            example_transition['chunk_length'] = np.array(horizon_length)
         if is_dsrl_expo:
             example_transition['refined_actions'] = example_true_actions.copy()
             example_transition['base_actions'] = example_true_actions.copy()
@@ -190,6 +210,9 @@ def run_dsrl_online_rl(
     log_step = start_step
     total_env_step = 0
     eval_step = 0
+    gradient_updates = 0
+    critic_gradient_updates = 0
+    episode_counter = 0
     update_info = {}
     online_rng = jax.random.PRNGKey(seed + 40000)
     eval_flags = _build_eval_flags(n_eval_envs, eval_episodes, discount, run_name, env_name)
@@ -201,7 +224,8 @@ def run_dsrl_online_rl(
         print(f"Resuming DSRL online loop at env step {total_env_step}")
 
     with tqdm.tqdm(total=online_steps, initial=total_env_step, desc="DSRL Online RL", dynamic_ncols=True) as pbar:
-        while total_env_step <= online_steps:
+        while total_env_step < online_steps:
+            previous_env_step = total_env_step
             online_rng, key = jax.random.split(online_rng)
 
             if len(action_queue) == 0:
@@ -248,11 +272,17 @@ def run_dsrl_online_rl(
                 terminated_all.append(terminated)
                 total_env_step += 1
                 pbar.update(1)
+                if done or total_env_step >= online_steps:
+                    action_queue = []
+                    break
 
             # Encode the post-chunk obs once for both the transition and next step
             next_ob = _encode_ob(raw_next_ob)
 
-            reward = max(reward_all)
+            if reward_aggregation == 'discounted_sum':
+                reward = sum(discount ** t * r for t, r in enumerate(reward_all))
+            else:
+                reward = max(reward_all)
             done = any(done_all)
             terminated = any(terminated_all)
 
@@ -272,6 +302,8 @@ def run_dsrl_online_rl(
                 masks=1.0 - float(terminated),
                 next_observations=next_ob,
             )
+            if reward_aggregation == 'discounted_sum':
+                transition['chunk_length'] = len(reward_all)
             if is_dsrl_expo:
                 transition['refined_actions'] = current_true_actions
                 transition['base_actions'] = current_base_actions
@@ -288,7 +320,9 @@ def run_dsrl_online_rl(
                     replay_buffer.add_transition(traj_transition)
 
                 trajectory_buffer = []
-                raw_ob, _ = env.reset(seed=seed + 10000 + total_env_step)
+                episode_counter += 1
+                reset_index = episode_counter if per_env_updates else total_env_step
+                raw_ob, _ = env.reset(seed=seed + 10000 + reset_index)
                 ob = _encode_ob(raw_ob)
                 action_queue = []
                 current_noise = None
@@ -300,8 +334,18 @@ def run_dsrl_online_rl(
             if total_env_step < start_training:
                 continue
 
+            # OGPO does UTD updates at each eligible *physical* env step.
+            # A chunk crossing start_training contributes only its eligible steps.
+            eligible_steps = max(0, total_env_step - max(previous_env_step, start_training - 1))
+            utd_ratio = utd_online * eligible_steps if per_env_updates else utd_online
+            if utd_ratio == 0:
+                continue
             min_required = batch_size * utd_ratio
             if replay_buffer.size < min_required:
+                if per_env_updates:
+                    raise RuntimeError(
+                        'Replay buffer cannot supply the matched update budget at '
+                        f'env step {total_env_step}; refusing to silently skip updates')
                 continue
 
             batch = replay_buffer.sample(batch_size * utd_ratio)
@@ -312,11 +356,21 @@ def run_dsrl_online_rl(
             if use_success_buffer:
                 num_successful = replay_buffer._traj_success_mask[:replay_buffer.size].sum()
                 min_success_required = success_buffer_batch_size * utd_ratio
+                if per_env_updates:
+                    # Match OGPO's threshold in physical transitions, not chunks.
+                    lengths = replay_buffer['chunk_length'][:replay_buffer.size]
+                    successful = replay_buffer._traj_success_mask[:replay_buffer.size]
+                    num_successful = lengths[successful].sum()
+                    min_success_required = success_buffer_batch_size * utd_online + horizon_length
                 if num_successful >= min_success_required:
                     try:
-                        batch_success = replay_buffer.sample(
-                            success_buffer_batch_size * utd_ratio,
-                            success_only=True)
+                        if per_env_updates:
+                            batch_success = _sample_success_chunks(
+                                replay_buffer, success_buffer_batch_size * utd_ratio)
+                        else:
+                            batch_success = replay_buffer.sample(
+                                success_buffer_batch_size * utd_ratio,
+                                success_only=True)
                         batch_success = _reshape_for_utd(
                             batch_success, utd_ratio, success_buffer_batch_size)
                         success_flag = True
@@ -326,15 +380,22 @@ def run_dsrl_online_rl(
             agent, update_info["online_agent"] = agent.batch_update(
                 _maybe_shard(batch), _maybe_shard(batch_success), success_flag)
 
+            gradient_updates += utd_ratio
+            extra_critic = config.get('critic_updates_per_actor', 1) == 2 or (
+                success_flag and config.get('use_success_buffer_q', False))
+            critic_gradient_updates += utd_ratio * (1 + int(extra_critic))
+
             if force_jax_sync:
                 jax.block_until_ready(agent)
-            if total_env_step % log_interval == 0 and update_info:
+            if log_interval > 0 and total_env_step // log_interval > previous_env_step // log_interval and update_info:
                 for key, info_dict in update_info.items():
                     logger.log(info_dict, key, step=log_step)
                 update_info = {}
+                logger.log(dict(env_steps=total_env_step, gradient_updates=gradient_updates,
+                                critic_gradient_updates=critic_gradient_updates, decoder_updates=0), 'online_budget', step=log_step)
 
             if total_env_step == online_steps or \
-                    (eval_interval > 0 and total_env_step % eval_interval == 0):
+                    (eval_interval > 0 and total_env_step // eval_interval > previous_env_step // eval_interval):
                 eval_step += 1
                 # Wrap the actor with the frozen encoder so the eval loop's raw
                 # dict obs is folded into the encoded vector the agent was init'd
@@ -356,7 +417,7 @@ def run_dsrl_online_rl(
                       f"success={float(eval_info.get('success', 0.0)):.4f}")
                 logger.log(eval_info, "eval", step=log_step)
 
-            if log_enabled and save_interval > 0 and total_env_step % save_interval == 0:
+            if log_enabled and save_interval > 0 and total_env_step // save_interval > previous_env_step // save_interval:
                 save_agent(agent, save_dir, log_step)
 
             if preemption_backup_interval > 0 and total_env_step % preemption_backup_interval == 0:
@@ -365,6 +426,14 @@ def run_dsrl_online_rl(
                     agent, replay_buffer, log_step, total_env_step, seed, env_name,
                     wandb_run_id=wandb_run_id, algo_name=algo_name)
 
+    if per_env_updates and not is_resumed:
+        expected = max(0, online_steps - max(1, start_training) + 1) * utd_online
+        if gradient_updates != expected:
+            raise RuntimeError(f'Actor update budget mismatch: {gradient_updates} != {expected}')
+        if config.get('critic_updates_per_actor', 1) == 2 and critic_gradient_updates != 2 * expected:
+            raise RuntimeError('Critic update budget mismatch')
+    logger.log(dict(env_steps=total_env_step, gradient_updates=gradient_updates,
+                    critic_gradient_updates=critic_gradient_updates, decoder_updates=0), 'online_budget', step=log_step)
     save_agent(agent, save_dir, log_step)
     print(f"DSRL online RL training complete. Final log_step: {log_step}")
     return agent, log_step, eval_info, replay_buffer

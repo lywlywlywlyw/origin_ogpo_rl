@@ -70,6 +70,8 @@ dataset:
   p_aug: null
 
 checkpoint:
+  resume: true
+  restore_bc_flow_path: null
   restore_actor_path: null
   restore_critic_path: null
   restore_encoder_path: null   # path to frozen encoder pkl (from extract_encoder.py)
