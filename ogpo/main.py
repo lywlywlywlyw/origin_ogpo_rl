@@ -38,11 +38,13 @@ from ogpo.runners.bc_runner import (
 from ogpo.runners.online_rl_runner import run_online_rl
 from ogpo.runners.dsrl_runner import run_dsrl_online_rl, DSRL_ALGORITHMS
 from ogpo.runners.pss_rl_runner import run_pss_online_rl
+from ogpo.runners.gorl_runner import run_gorl_online_rl
 from ogpo.agents.ogpo import OGPOAgent
 from ogpo.agents.qc import ACFQLAgent
 from ogpo.agents.bptt import OGPOBPTTAgent
 from ogpo.agents.dsrl import DSRLBestOfNAgent
 from ogpo.agents.pss import PSSAgent
+from ogpo.agents.gorl import GoRLAgent
 from ogpo.agents.expo import EXPOAgent
 from ogpo.agents.dsrl_plus_expo import DSRLEXPOAgent
 
@@ -135,6 +137,7 @@ AGENTS = {
     "dsrl": DSRLBestOfNAgent,
     "dsrl_bon": DSRLBestOfNAgent,
     "pss": PSSAgent,
+    "gorl": GoRLAgent,
     "expo": EXPOAgent,
     "dsrl_plus_expo": DSRLEXPOAgent,
 }
@@ -162,14 +165,22 @@ def main():
     checkpoint_config = config["checkpoint"]
     agent_config = config_to_agent_dict(config)
 
-    if algo_name == 'pss':
+    if algo_name in ('pss', 'gorl'):
         if checkpoint_config.get('resume'):
-            raise ValueError('PSS currently requires checkpoint.resume=false')
+            raise ValueError(f'{algo_name} requires checkpoint.resume=false')
         if any(train_config[key] for key in
                ('bc_pi_steps', 'bc_q_steps', 'calql_steps', 'q_warmup_steps', 'bc_refine_steps')):
-            raise ValueError('PSS requires zero offline/pretraining/refinement steps')
+            raise ValueError(f'{algo_name} requires zero generic offline/pretraining/refinement steps')
         if not checkpoint_config.get('restore_bc_flow_path') and not checkpoint_config.get('resume'):
-            raise ValueError('PSS requires checkpoint.restore_bc_flow_path')
+            raise ValueError(f'{algo_name} requires checkpoint.restore_bc_flow_path')
+
+    if algo_name == 'gorl':
+        if success_buffer_config['use_success_buffer'] or buffer_config['offline_ratio'] != 0:
+            raise ValueError('GoRL PPO requires success buffer disabled and offline_ratio=0')
+        if checkpoint_config.get('restore_actor_path') or checkpoint_config.get('restore_critic_path'):
+            raise ValueError('GoRL resets its encoder/value; only restore the BC decoder')
+        if train_config.get('gpu_mode', 'single') != 'single':
+            raise ValueError('GoRL currently requires training.gpu_mode=single')
 
     if algo_name not in AGENTS:
         raise ValueError(
@@ -378,10 +389,10 @@ def main():
     # Restore pre-trained weights
     flow_path = checkpoint_config.get('restore_bc_flow_path')
     if not is_resumed and flow_path:
-        if algo_name not in ('dsrl', 'pss'):
-            raise ValueError('restore_bc_flow_path currently supports only dsrl and pss')
+        if algo_name not in ('dsrl', 'pss', 'gorl'):
+            raise ValueError('restore_bc_flow_path currently supports dsrl, pss and gorl')
         if train_config['bc_pi_steps'] != 0:
-            raise ValueError('Shared frozen BC flow requires training.bc_pi_steps=0')
+            raise ValueError('Shared BC flow initialization requires training.bc_pi_steps=0')
         agent = agent.restore_bc_flow_params(flow_path)
 
     if not is_resumed:
@@ -642,7 +653,9 @@ def main():
         mesh=mesh,
     )
 
-    if algo_name == 'pss':
+    if algo_name == 'gorl':
+        agent, log_step, final_eval_info, replay_buffer = run_gorl_online_rl(**runner_kwargs)
+    elif algo_name == 'pss':
         agent, log_step, final_eval_info, replay_buffer = run_pss_online_rl(
             **runner_kwargs
         )

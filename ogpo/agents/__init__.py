@@ -10,6 +10,7 @@ __all__ = [
     'bptt',
     'dsrl',
     'pss',
+    'gorl',
     'expo',
     'dsrl_plus_expo',
 ]

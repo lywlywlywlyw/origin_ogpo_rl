@@ -1,0 +1,50 @@
+# GoRL-FM/DMControl defaults, except the explicitly listed comparison adapters.
+_base_: dsrl_ogpo_square_shared.yaml
+experiment:
+  run_name: gorl_square_shared_ogpo_bc
+  wandb_name: gorl_square_shared_ogpo_bc
+buffer:
+  start_training: 0  # GoRL has no SAC replay warmup.
+success_buffer:
+  use_success_buffer: false
+agent:
+  agent_name: gorl
+  use_success_buffer_q: false
+  # Encoder/decoder retain DSRL backbone. Restore the original single PPO V(s).
+  value_hidden_dims: [256, 256, 256, 256, 256]
+  num_qs: 1
+  layer_norm: false
+  optimizer_actor: adam
+  optimizer_critic: adam
+  optimizer_actor_bc_flow: adam
+  lr_actor: 0.001
+  lr_critic: 0.001
+  lr_actor_bc_flow: 0.0003
+  gorl_max_grad_norm: 0.5  # Joint PPO gradients ONLY; decoder uses plain Adam.
+  gorl_policy_scale_cap: 10.0
+  gorl_reward_scaling: 10.0
+  gorl_ppo_epochs: 16
+  gorl_unroll_length: 30
+  gorl_ppo_batch_size: 1024  # Sequences, not individual chunk transitions.
+  gorl_num_minibatches: 32
+  gorl_ppo_clip_first: 0.15
+  gorl_ppo_clip: 0.3
+  gorl_entropy_coef: 0.01
+  gorl_value_coef: 0.25
+  gorl_gae_lambda: 0.95
+  gorl_z_reg_first: 0.0005
+  gorl_z_reg: 0.001
+  gorl_stage_weights: [2, 2, 1, 1]
+  gorl_collection_episodes: 4096
+  gorl_decoder_steps: 50000
+  gorl_decoder_batch_size: 8192
+  gorl_decoder_initialization: fresh
+  gorl_samples_per_action: 8
+  gorl_validation_fraction: 0.1
+  gorl_decoder_eval_interval: 100
+  gorl_decoder_eval_batches: 8
+  # Comparison adapters: serial Robomimic, 2M TOTAL physical steps, evaluation
+  # every 10k. Cap huge MJX batches/collection to fit this budget. Actual counts
+  # are recorded. Gamma=.99 per physical step and H=4 inherit from baselines.
+  gorl_rollout_max_env_steps: 10000
+  gorl_collection_steps: 10000
