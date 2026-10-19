@@ -1,0 +1,13 @@
+# PSS geometry from Ni et al.; SAC settings/budgets match the existing DSRL run.
+# Inheritance deliberately keeps the environment, decoder, checkpoint, learning
+# rates, success-buffer regularization and physical-step accounting identical.
+_base_: dsrl_ogpo_square_shared.yaml
+experiment:
+  run_name: pss_square_shared_ogpo_bc
+  wandb_name: pss_square_shared_ogpo_bc
+agent:
+  agent_name: pss
+  pss_dim: 8
+  pss_num_probes: 64
+  pss_delta: 0.05
+  pss_probe_batch_size: 64

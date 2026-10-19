@@ -9,6 +9,7 @@ __all__ = [
     'qc',
     'bptt',
     'dsrl',
+    'pss',
     'expo',
     'dsrl_plus_expo',
 ]

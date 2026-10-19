@@ -1,0 +1,37 @@
+# Paper-style online SAC settings (Table I, Square), using the repository's
+# existing flow backbone. Pass checkpoint.restore_bc_flow_path explicitly.
+# Use pss_ogpo_square_shared for comparison with the completed local baselines.
+_base_: dsrl.yaml
+experiment:
+  run_name: pss
+  wandb_name: pss
+training:
+  bc_pi_steps: 0
+  bc_q_steps: 0
+  calql_steps: 0
+  q_warmup_steps: 0
+  bc_refine_steps: 0
+checkpoint:
+  resume: false
+success_buffer:
+  use_success_buffer: false
+agent:
+  agent_name: pss
+  pss_dim: 8
+  pss_num_probes: 64
+  pss_delta: 0.05
+  pss_probe_batch_size: 64
+  action_magnitude: 1.0
+  entropy_backup: true
+  target_entropy: null
+  pss_entropy_scale: 1.0
+  q_agg: min
+  num_qs: 2
+  tau: 0.005
+  discount: 0.999
+  use_success_buffer_q: false
+  critic_updates_per_actor: 1
+  updates_per_env_step: false
+  chunk_reward_aggregation: query_sum
+buffer:
+  utd_online: 20
