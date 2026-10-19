@@ -1,4 +1,4 @@
-# DSRL behavior plus an independent Q(s,a) for sensitivity diagnostics.
+# TD action critic with Gaussian-noise distillation into Q(s,z).
 _base_: dsrl.yaml
 agent:
   agent_name: grace

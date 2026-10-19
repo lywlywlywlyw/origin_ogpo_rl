@@ -28,12 +28,12 @@ from ogpo.agents.modules.pg_helper import (
 )
 
 class GRACEAgent(flax.struct.PyTreeNode):
-    """DSRL with an independent action critic and input-sensitivity diagnostics.
+    """DSRL with action-Q distillation and input-sensitivity diagnostics.
 
     The actor and latent critic operate in noise space; the actor outputs noise
     in [-action_magnitude, action_magnitude]. The frozen flow maps it to actions.
-    An independent action critic learns the same chunk returns using decoded
-    actions and contributes diagnostics only.
+    The action critic learns chunk returns via TD. The latent critic regresses
+    onto its values at actions decoded from standard Gaussian noise.
     """
 
     rng: Any
@@ -44,54 +44,29 @@ class GRACEAgent(flax.struct.PyTreeNode):
     config: Any = nonpytree_field()
 
     def critic_loss(self, batch, grad_params, rng):
-        rng, sample_rng = jax.random.split(rng)
-        next_dist = self.actor_network.select('actor')(batch['next_observations'])
-        next_actions, next_log_probs = next_dist.sample_and_log_prob(seed=sample_rng)
-
-        next_qs = self.critic_network.select('target_critic')(batch['next_observations'], actions=next_actions)
-        if self.config['q_agg'] == 'min':
-            next_q = jnp.min(next_qs, axis=0)
-        else:
-            next_q = jnp.mean(next_qs, axis=0)
-
-        temp = self.actor_network.select('temp')()
-
-        if self.config['entropy_backup']:
-            next_log_probs = jnp.clip(next_log_probs, -100, 100)
-            target_q = batch['rewards'] + \
-                (self.config['discount'] ** batch.get('chunk_length', self.config['horizon_length'])) * batch['masks'] * \
-                (next_q - temp * next_log_probs)
-        else:
-            target_q = batch['rewards'] + \
-                (self.config['discount'] ** batch.get('chunk_length', self.config['horizon_length'])) * batch['masks'] * next_q
-
-        target_q = jnp.clip(target_q, -500.0, 500.0)
-
-        q = self.critic_network.select('critic')(batch['observations'], actions=batch["actions"], params=grad_params)
-        critic_loss = jnp.mean((q - target_q) ** 2)
-
-        info = {
+        # Distill the online action critic at fresh z ~ N(0, I), rather than
+        # bootstrapping Q(s, z) from rewards or its own target network.
+        noises = jax.random.normal(rng, batch['actions'].shape, dtype=batch['actions'].dtype)
+        actions = self.noise_to_actions_public(batch['observations'], noises)
+        target_q = jax.lax.stop_gradient(self._aggregate_q(
+            self.action_critic_network.select('critic')(
+                batch['observations'], actions=actions)))
+        q = self.critic_network.select('critic')(
+            batch['observations'], actions=noises, params=grad_params)
+        critic_loss = jnp.mean(jnp.square(q - target_q))
+        return critic_loss, {
             'critic_loss': critic_loss,
+            'distillation_loss': critic_loss,
             'q_mean': q.mean(), 'q_max': q.max(), 'q_min': q.min(),
-            'target_q_mean': target_q.mean(), 'temp': temp,
-            'next_actions_mean': next_actions.mean(),
-            'next_actions_min': next_actions.min(),
-            'next_actions_max': next_actions.max(),
-            'next_actions_std': next_actions.std(),
-            'rewards_mean': batch['rewards'].mean(),
-            'rewards_min': batch['rewards'].min(),
-            'rewards_max': batch['rewards'].max(),
+            'target_q_mean': target_q.mean(),
+            'noise_mean': noises.mean(), 'noise_std': noises.std(),
         }
-        if self.config['entropy_backup']:
-            info['next_log_probs_mean'] = next_log_probs.mean()
-
-        return critic_loss, info
 
     def _aggregate_q(self, qs):
         return jnp.min(qs, axis=0) if self.config['q_agg'] == 'min' else jnp.mean(qs, axis=0)
 
     def action_critic_loss(self, batch, grad_params, rng):
-        # Use the same next latent sample as Q^Z, with a separate Q^A target.
+        # Bootstrap Q^A at the next action decoded from the latent actor.
         _, sample_rng = jax.random.split(rng)
         dist = self.actor_network.select('actor')(batch['next_observations'])
         next_z, log_probs = dist.sample_and_log_prob(seed=sample_rng)
@@ -139,12 +114,14 @@ class GRACEAgent(flax.struct.PyTreeNode):
 
     def _critic_step(self, batch, rng):
         metrics = self.input_gradient_metrics(batch)
-        latent_state, latent_info = self.critic_network.apply_loss_fn(
-            lambda p: self.critic_total_loss(batch, p, rng))
+        action_rng, latent_rng = jax.random.split(rng)
         action_state, action_info = self.action_critic_network.apply_loss_fn(
-            lambda p: self.action_critic_loss(batch, p, rng))
-        self.target_update(latent_state, 'critic')
+            lambda p: self.action_critic_loss(batch, p, action_rng))
         self.target_update(action_state, 'critic')
+        teacher = self.replace(action_critic_network=action_state)
+        latent_state, latent_info = self.critic_network.apply_loss_fn(
+            lambda p: teacher.critic_total_loss(batch, p, latent_rng))
+        self.target_update(latent_state, 'critic')
         # Give optimizer diagnostics for Q^A their own namespace as well.
         action_info = {k if k.startswith('action_critic/') else f'action_critic/{k}': v
                        for k, v in action_info.items()}

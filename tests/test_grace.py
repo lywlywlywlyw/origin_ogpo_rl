@@ -1,4 +1,4 @@
-"""GRACE parity with DSRL and per-sample input-gradient diagnostics."""
+"""GRACE action-Q distillation and per-sample input-gradient diagnostics."""
 import os
 os.environ.setdefault('JAX_PLATFORMS', 'cpu')
 import pickle
@@ -54,7 +54,7 @@ class GraceTests(unittest.TestCase):
         from ogpo.utils.main_helper import training_log_prefixes
         self.assertIn('online_budget', training_log_prefixes('grace', 100))
 
-    def test_exact_dsrl_updates_and_frozen_decoder(self):
+    def test_distillation_updates_and_frozen_decoder(self):
         dsrl, grace = make_pair()
         self.assertEqual(grace.config['gradient_delta_a'], 1.)
         self.assertEqual(grace.config['gradient_delta_z'], 1.)
@@ -69,18 +69,61 @@ class GraceTests(unittest.TestCase):
         frozen = grace.bc_flow_network
         data = batch()
         for success in (False, True):
-            dsrl, dsrl_metrics = dsrl.batch_update(data, data if success else None, success)
             grace, metrics = grace.batch_update(data, data if success else None, success)
-            for key, value in dsrl_metrics.items():
-                np.testing.assert_allclose(metrics[key], value, atol=1e-6, rtol=1e-6,
-                                           err_msg=f'Legacy metric changed: {key}')
-            assert_tree_equal(self, dsrl.actor_network, grace.actor_network)
-            assert_tree_equal(self, dsrl.critic_network, grace.critic_network)
+            self.assertTrue(np.isfinite(metrics['critic/distillation_loss']))
+            np.testing.assert_allclose(metrics['critic/critic_loss'],
+                                       metrics['critic/distillation_loss'])
             assert_tree_equal(self, frozen, grace.bc_flow_network)
             self.assertEqual(int(grace.action_critic_network.step), int(grace.critic_network.step))
             for key in ('grad_z_norm', 'grad_a_norm', 'ratio'):
                 self.assertTrue(np.isfinite(metrics['sensitivity/' + key]))
         self.assertEqual(int(grace.critic_network.step), 9)  # 2 scans * 2 Q steps * 2 calls + init
+
+    def test_gaussian_distillation_target_and_stopped_teacher_gradient(self):
+        _, grace = make_pair()
+        data = jax.tree.map(lambda x: x[0], batch())
+        rng = jax.random.PRNGKey(19)
+        z = jax.random.normal(rng, data['actions'].shape, dtype=data['actions'].dtype)
+        a = grace.noise_to_actions_public(data['observations'], z)
+        target = grace._aggregate_q(grace.action_critic_network.select('critic')(
+            data['observations'], actions=a))
+        q = grace.critic_network.select('critic')(
+            data['observations'], actions=z)
+        loss, info = grace.critic_loss(data, grace.critic_network.params, rng)
+        np.testing.assert_allclose(loss, jnp.mean(jnp.square(q - target)), rtol=1e-6)
+        np.testing.assert_allclose(info['target_q_mean'], target.mean(), rtol=1e-6)
+
+        # Replay noise and TD fields do not supply the distillation target.
+        changed = dict(data, actions=jnp.full_like(data['actions'], 100.),
+                       true_actions=jnp.zeros_like(data['true_actions']),
+                       rewards=data['rewards'] * 100., masks=jnp.zeros_like(data['masks']),
+                       next_observations=data['next_observations'] * 100.)
+        changed_loss, _ = grace.critic_loss(changed, grace.critic_network.params, rng)
+        np.testing.assert_allclose(changed_loss, loss, rtol=1e-6)
+
+        def teacher_loss(params):
+            teacher = grace.replace(action_critic_network=
+                                    grace.action_critic_network.replace(params=params))
+            return teacher.critic_loss(data, grace.critic_network.params, rng)[0]
+        grads = jax.grad(teacher_loss)(grace.action_critic_network.params)
+        for leaf in jax.tree.leaves(grads):
+            np.testing.assert_array_equal(leaf, jnp.zeros_like(leaf))
+
+    def test_latent_step_uses_updated_online_action_critic(self):
+        _, grace = make_pair()
+        data = jax.tree.map(lambda x: x[0], batch())
+        rng = jax.random.PRNGKey(23)
+        action_rng, latent_rng = jax.random.split(rng)
+        action_state, _ = grace.action_critic_network.apply_loss_fn(
+            lambda p: grace.action_critic_loss(data, p, action_rng))
+        grace.target_update(action_state, 'critic')
+        teacher = grace.replace(action_critic_network=action_state)
+        expected, _ = grace.critic_network.apply_loss_fn(
+            lambda p: teacher.critic_total_loss(data, p, latent_rng))
+        grace.target_update(expected, 'critic')
+        updated, _ = grace._critic_step(data, rng)
+        assert_tree_equal(self, updated.action_critic_network, action_state)
+        assert_tree_equal(self, updated.critic_network, expected)
 
     def test_analytic_per_sample_norms_and_mean_of_ratios(self):
         class Network:
