@@ -1,0 +1,10 @@
+# Inherit the exact matched DSRL run, including its frozen offline checkpoint.
+_base_: dsrl_ogpo_square_shared.yaml
+experiment:
+  run_name: grace_square_shared_ogpo_bc
+  wandb_name: grace_square_shared_ogpo_bc
+agent:
+  agent_name: grace
+  gradient_delta_a: null
+  gradient_delta_z: null
+  gradient_ratio_epsilon: 1.0e-8

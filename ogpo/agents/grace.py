@@ -27,17 +27,20 @@ from ogpo.agents.modules.pg_helper import (
     sample_flow_actions_ode,
 )
 
-class DSRLBestOfNAgent(flax.struct.PyTreeNode):
-    """DSRL: SAC noise actor over a frozen BC flow policy.
+class GRACEAgent(flax.struct.PyTreeNode):
+    """DSRL with an independent action critic and input-sensitivity diagnostics.
 
-    The critic and actor operate in noise space; the actor outputs noise in
-    [-action_magnitude, action_magnitude] which the flow policy maps to actions.
+    The actor and latent critic operate in noise space; the actor outputs noise
+    in [-action_magnitude, action_magnitude]. The frozen flow maps it to actions.
+    An independent action critic learns the same chunk returns using decoded
+    actions and contributes diagnostics only.
     """
 
     rng: Any
     actor_network: TrainState
     critic_network: TrainState
     bc_flow_network: TrainState
+    action_critic_network: TrainState
     config: Any = nonpytree_field()
 
     def critic_loss(self, batch, grad_params, rng):
@@ -83,6 +86,70 @@ class DSRLBestOfNAgent(flax.struct.PyTreeNode):
             info['next_log_probs_mean'] = next_log_probs.mean()
 
         return critic_loss, info
+
+    def _aggregate_q(self, qs):
+        return jnp.min(qs, axis=0) if self.config['q_agg'] == 'min' else jnp.mean(qs, axis=0)
+
+    def action_critic_loss(self, batch, grad_params, rng):
+        # Use the same next latent sample as Q^Z, with a separate Q^A target.
+        _, sample_rng = jax.random.split(rng)
+        dist = self.actor_network.select('actor')(batch['next_observations'])
+        next_z, log_probs = dist.sample_and_log_prob(seed=sample_rng)
+        next_a = self.noise_to_actions_public(batch['next_observations'], next_z)
+        next_q = self._aggregate_q(self.action_critic_network.select('target_critic')(
+            batch['next_observations'], actions=next_a))
+        if self.config['entropy_backup']:
+            next_q -= self.actor_network.select('temp')() * jnp.clip(log_probs, -100, 100)
+        target = jnp.clip(batch['rewards'] + self.config['discount'] ** batch.get(
+            'chunk_length', self.config['horizon_length']) * batch['masks'] * next_q, -500., 500.)
+        q = self.action_critic_network.select('critic')(
+            batch['observations'], actions=batch['true_actions'], params=grad_params)
+        loss = jnp.mean(jnp.square(q - target))
+        return loss, {'action_critic/loss': loss, 'action_critic/q_mean': q.mean(),
+                      'action_critic/target_q_mean': target.mean()}
+
+    def input_gradient_metrics(self, batch):
+        """Pre-update online-Q gradients, at paired replay (s, z, a).
+
+        Differentiate the ensemble aggregate before taking each sample's L2
+        norm. R is averaged per sample, not a ratio of batch-averaged norms.
+        Radii are half the allowed coordinate intervals, not distances to bounds.
+        """
+        def gradient_norm(network, inputs):
+            def sum_q(x):
+                return self._aggregate_q(network.select('critic')(
+                    batch['observations'], actions=x)).sum()
+            # Value networks do not mix samples. Summing Q avoids a 1/B factor.
+            gradients = jax.grad(sum_q)(inputs)
+            return jnp.linalg.norm(gradients, axis=-1)
+
+        z_norm = gradient_norm(self.critic_network, batch['actions'])
+        a_norm = gradient_norm(self.action_critic_network, batch['true_actions'])
+        delta_z = self.config['gradient_delta_z']
+        delta_a = self.config['gradient_delta_a']
+        z_scaled, a_scaled = delta_z * z_norm, delta_a * a_norm
+        ratio = a_scaled / (z_scaled + self.config['gradient_ratio_epsilon'])
+        return jax.tree.map(jax.lax.stop_gradient, {
+            'sensitivity/grad_z_norm': z_norm.mean(),
+            'sensitivity/grad_a_norm': a_norm.mean(),
+            'sensitivity/scaled_grad_z_norm': z_scaled.mean(),
+            'sensitivity/scaled_grad_a_norm': a_scaled.mean(),
+            'sensitivity/ratio': ratio.mean(),
+        })
+
+    def _critic_step(self, batch, rng):
+        metrics = self.input_gradient_metrics(batch)
+        latent_state, latent_info = self.critic_network.apply_loss_fn(
+            lambda p: self.critic_total_loss(batch, p, rng))
+        action_state, action_info = self.action_critic_network.apply_loss_fn(
+            lambda p: self.action_critic_loss(batch, p, rng))
+        self.target_update(latent_state, 'critic')
+        self.target_update(action_state, 'critic')
+        # Give optimizer diagnostics for Q^A their own namespace as well.
+        action_info = {k if k.startswith('action_critic/') else f'action_critic/{k}': v
+                       for k, v in action_info.items()}
+        return self.replace(critic_network=latent_state, action_critic_network=action_state), {
+            **latent_info, **action_info, **metrics}
 
     def actor_loss(self, batch, grad_params, rng):
         rng, sample_rng = jax.random.split(rng)
@@ -181,41 +248,42 @@ class DSRLBestOfNAgent(flax.struct.PyTreeNode):
         network.params[f'modules_target_{module_name}'] = new_target_params
 
     @staticmethod
-    def _extra_critic_update(agent, batch, success_batch, success_flag, rng):
+    def _extra_critic_update(agent, batch, success_batch, success_flag, rng, first_info):
         fixed_extra = agent.config.get('critic_updates_per_actor', 1) == 2
         if not fixed_extra and not agent.config.get('use_success_buffer_q', False):
-            return agent
+            return agent, first_info
         if success_batch is None:
             success_batch = batch
         chosen = jax.lax.cond(success_flag, lambda: success_batch, lambda: batch)
         def update(current):
-            def loss_fn(p):
-                return current.critic_total_loss(chosen, p, rng)
-            state, _ = current.critic_network.apply_loss_fn(loss_fn)
-            current.target_update(state, 'critic')
-            return current.replace(critic_network=state)
-        return jax.lax.cond(jnp.logical_or(fixed_extra, success_flag), update, lambda a: a, agent)
+            current, extra_info = current._critic_step(chosen, rng)
+            # Preserve DSRL's first-update metrics. Only new diagnostics
+            # include both Q updates.
+            info = {
+                key: (value + extra_info[key]) / 2
+                if key.startswith(('sensitivity/', 'action_critic/')) else value
+                for key, value in first_info.items()
+            }
+            return current, info
+        return jax.lax.cond(jnp.logical_or(fixed_extra, success_flag), update,
+                            lambda a: (a, first_info), agent)
 
     @staticmethod
-    def _update(agent, batch: dict) -> Tuple['DSRLBestOfNAgent', dict]:
+    def _update(agent, batch: dict) -> Tuple['GRACEAgent', dict]:
         new_rng, rng1, rng2 = jax.random.split(agent.rng, 3)
 
         def actor_loss_fn(p):
             return agent.actor_total_loss(batch, p, rng1)
         new_actor_state, actor_info = agent.actor_network.apply_loss_fn(actor_loss_fn)
 
-        def critic_loss_fn(p):
-            return agent.critic_total_loss(batch, p, rng2)
-        new_critic_state, critic_info = agent.critic_network.apply_loss_fn(critic_loss_fn)
-        agent.target_update(new_critic_state, 'critic')
-
-        agent = agent.replace(
-            actor_network=new_actor_state, critic_network=new_critic_state, rng=new_rng)
-        agent = agent._extra_critic_update(agent, batch, None, False, jax.random.fold_in(rng2, 1))
+        agent, critic_info = agent._critic_step(batch, rng2)
+        agent = agent.replace(actor_network=new_actor_state, rng=new_rng)
+        agent, critic_info = agent._extra_critic_update(
+            agent, batch, None, False, jax.random.fold_in(rng2, 1), critic_info)
         return agent, {**actor_info, **critic_info}
 
     @staticmethod
-    def _update_offline(agent, batch: dict) -> Tuple['DSRLBestOfNAgent', dict]:
+    def _update_offline(agent, batch: dict) -> Tuple['GRACEAgent', dict]:
         new_rng, rng1 = jax.random.split(agent.rng, 2)
         def bc_loss_fn(p):
             return agent.bc_loss(batch, p, rng1)
@@ -227,7 +295,7 @@ class DSRLBestOfNAgent(flax.struct.PyTreeNode):
         return self._update_offline(self, batch)
 
     @staticmethod
-    def _update_with_bc(agent, batch_tuple: Tuple[dict, dict, bool]) -> Tuple['DSRLBestOfNAgent', dict]:
+    def _update_with_bc(agent, batch_tuple: Tuple[dict, dict, bool]) -> Tuple['GRACEAgent', dict]:
         batch, batch_success, success_flag = batch_tuple
         new_rng, rng1, rng2, rng3 = jax.random.split(agent.rng, 4)
 
@@ -251,14 +319,10 @@ class DSRLBestOfNAgent(flax.struct.PyTreeNode):
 
         new_actor_state, actor_info = agent.actor_network.apply_loss_fn(actor_loss_fn)
 
-        def critic_loss_fn(p):
-            return agent.critic_total_loss(batch, p, rng2)
-        new_critic_state, critic_info = agent.critic_network.apply_loss_fn(critic_loss_fn)
-        agent.target_update(new_critic_state, 'critic')
-
-        agent = agent.replace(
-            actor_network=new_actor_state, critic_network=new_critic_state, rng=new_rng)
-        agent = agent._extra_critic_update(agent, batch, batch_success, success_flag, rng3)
+        agent, critic_info = agent._critic_step(batch, rng2)
+        agent = agent.replace(actor_network=new_actor_state, rng=new_rng)
+        agent, critic_info = agent._extra_critic_update(
+            agent, batch, batch_success, success_flag, rng3, critic_info)
         return agent, {**actor_info, **critic_info}
 
     @jax.jit
@@ -559,6 +623,26 @@ class DSRLBestOfNAgent(flax.struct.PyTreeNode):
 
         critic_state.params[f'modules_target_critic'] = critic_state.params[f'modules_critic']
 
+        # Independent parameters and optimizer; keep all DSRL RNG splits intact.
+        action_critic_def = ModuleDict({
+            'critic': copy.deepcopy(critic_def),
+            'target_critic': copy.deepcopy(critic_def),
+        })
+        action_params = action_critic_def.init(jax.random.fold_in(critic_rng, 1),
+            critic=(ex_observations, full_actions),
+            target_critic=(ex_observations, full_actions))['params']
+        action_params['modules_target_critic'] = action_params['modules_critic']
+        action_critic_state = TrainState.create(action_critic_def, action_params, critic_tx)
+        for key, default in (
+            ('gradient_delta_a', (config['act_max'] - config['act_min']) / 2),
+            ('gradient_delta_z', config['action_magnitude']),
+            ('gradient_ratio_epsilon', 1e-8),
+        ):
+            if config.get(key) is None:
+                config[key] = default
+            if not 0 < float(config[key]) < float('inf'):
+                raise ValueError(f'{key} must be finite and positive')
+
         config['ob_dims'] = ob_dims
         config['action_dim'] = action_dim
         config["noise_dim"] = noise_dim
@@ -566,4 +650,4 @@ class DSRLBestOfNAgent(flax.struct.PyTreeNode):
         if config['target_entropy'] is None:
             config['target_entropy'] = -float(noise_dim) / 2
 
-        return cls(rng, actor_state, critic_state, bc_flow_state, config=flax.core.FrozenDict(**config))
+        return cls(rng, actor_state, critic_state, bc_flow_state, action_critic_state, config=flax.core.FrozenDict(**config))

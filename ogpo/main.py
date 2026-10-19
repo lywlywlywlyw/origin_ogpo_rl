@@ -43,6 +43,8 @@ from ogpo.agents.ogpo import OGPOAgent
 from ogpo.agents.qc import ACFQLAgent
 from ogpo.agents.bptt import OGPOBPTTAgent
 from ogpo.agents.dsrl import DSRLBestOfNAgent
+from ogpo.agents.grace import GRACEAgent
+from ogpo.runners.grace_runner import run_grace_online_rl
 from ogpo.agents.pss import PSSAgent
 from ogpo.agents.gorl import GoRLAgent
 from ogpo.agents.expo import EXPOAgent
@@ -135,6 +137,7 @@ AGENTS = {
     "bptt": OGPOBPTTAgent,
     "ogpo_bptt": OGPOBPTTAgent,
     "dsrl": DSRLBestOfNAgent,
+    "grace": GRACEAgent,
     "dsrl_bon": DSRLBestOfNAgent,
     "pss": PSSAgent,
     "gorl": GoRLAgent,
@@ -165,7 +168,7 @@ def main():
     checkpoint_config = config["checkpoint"]
     agent_config = config_to_agent_dict(config)
 
-    if algo_name in ('pss', 'gorl'):
+    if algo_name in ('pss', 'gorl', 'grace'):
         if checkpoint_config.get('resume'):
             raise ValueError(f'{algo_name} requires checkpoint.resume=false')
         if any(train_config[key] for key in
@@ -389,8 +392,8 @@ def main():
     # Restore pre-trained weights
     flow_path = checkpoint_config.get('restore_bc_flow_path')
     if not is_resumed and flow_path:
-        if algo_name not in ('dsrl', 'pss', 'gorl'):
-            raise ValueError('restore_bc_flow_path currently supports dsrl, pss and gorl')
+        if algo_name not in ('dsrl', 'pss', 'gorl', 'grace'):
+            raise ValueError('restore_bc_flow_path currently supports dsrl, pss, gorl and grace')
         if train_config['bc_pi_steps'] != 0:
             raise ValueError('Shared BC flow initialization requires training.bc_pi_steps=0')
         agent = agent.restore_bc_flow_params(flow_path)
@@ -659,6 +662,8 @@ def main():
         agent, log_step, final_eval_info, replay_buffer = run_pss_online_rl(
             **runner_kwargs
         )
+    elif algo_name == 'grace':
+        agent, log_step, final_eval_info, replay_buffer = run_grace_online_rl(**runner_kwargs)
     elif algo_name in DSRL_ALGORITHMS:
         agent, log_step, final_eval_info, replay_buffer = run_dsrl_online_rl(
             **runner_kwargs

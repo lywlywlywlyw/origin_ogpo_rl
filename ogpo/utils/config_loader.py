@@ -228,7 +228,7 @@ def parse_cli_args(argv: Optional[List[str]] = None) -> tuple:
         '--algo', '--agent', '-a',
         type=str,
         default='ogpo',
-        help='Algorithm name (ogpo, qc, bptt, dsrl, pss, gorl, expo, dsrl_plus_expo)'
+        help='Algorithm name (ogpo, qc, bptt, dsrl, grace, pss, gorl, expo, dsrl_plus_expo)'
     )
 
     args, remaining = parser.parse_known_args(argv)

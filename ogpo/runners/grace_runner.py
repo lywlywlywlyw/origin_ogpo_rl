@@ -1,9 +1,7 @@
-"""Online RL training runner for DSRL and DSRL+EXPO algorithms.
+"""GRACE online runner using DSRL chunk collection and physical-step budgets.
 
-These algorithms require chunk-level transitions with noise stored in the replay
-buffer, flat batch sampling, and max-reward aggregation over action chunks.
-This is fundamentally different from the per-step storage used by the unified
-online_rl_runner.py.
+Replay stores paired latent noise and decoded action chunks. Logging follows
+DSRL: report the latest batch_update result at each logging interval.
 """
 
 from types import SimpleNamespace
@@ -24,7 +22,7 @@ from ogpo.runners.online_rl_runner import (
 )
 
 
-DSRL_ALGORITHMS = {'dsrl', 'dsrl_bon', 'dsrl_plus_expo'}
+GRACE_ALGORITHMS = {'grace'}
 
 
 def _build_eval_flags(n_eval_envs, eval_episodes, discount, run_name, env_name):
@@ -67,7 +65,7 @@ def _sample_success_chunks(replay_buffer, batch_size):
     return replay_buffer.sample(batch_size, idxs=indices)
 
 
-def run_dsrl_online_rl(
+def run_grace_online_rl(
     agent: Any,
     env: Any,
     eval_env: Any,
@@ -99,7 +97,7 @@ def run_dsrl_online_rl(
     video_episodes: int = 0,
     video_frame_skip: int = 3,
     plot_q_vs_mc: bool = False,
-    run_name: str = 'dsrl',
+    run_name: str = 'grace',
     env_name: str = '',
     log_interval: int = 5000,
     step_data_log_interval: int = 10,
@@ -120,10 +118,10 @@ def run_dsrl_online_rl(
     mc_regression: bool = False,
     mesh=None,
 ) -> Tuple[Any, int, Dict, ReplayBuffer]:
-    """Online RL runner for DSRL/DSRL+EXPO. Stores chunk-level transitions with
+    """Online RL runner for GRACE. Stores chunk-level transitions with
     noise as 'actions' and denoised actions as 'true_actions'."""
-    assert algo_name in DSRL_ALGORITHMS, f"Expected DSRL algorithm, got {algo_name}"
-    assert offline_ratio == 0.0, f"DSRL requires offline_ratio=0.0, got {offline_ratio}"
+    assert algo_name in GRACE_ALGORITHMS, f"Expected GRACE algorithm, got {algo_name}"
+    assert offline_ratio == 0.0, f"GRACE requires offline_ratio=0.0, got {offline_ratio}"
 
     example_batch = train_dataset.sample(())
     action_dim = example_batch['actions'].shape[-1]
@@ -136,14 +134,12 @@ def run_dsrl_online_rl(
 
     per_env_updates = config.get('updates_per_env_step', False)
     if per_env_updates and any(u is not None and u != utd_online for u in (utd_q, utd_pi)):
-        raise ValueError('DSRL matched budget requires equal actor/critic UTD')
+        raise ValueError('GRACE matched budget requires equal actor/critic UTD')
     reward_aggregation = config.get('chunk_reward_aggregation', 'max')
     if per_env_updates and reward_aggregation != 'discounted_sum':
         raise ValueError('Matched env-step budget requires discounted_sum rewards/chunk lengths')
     if reward_aggregation not in ('max', 'discounted_sum'):
         raise ValueError(f'Unknown chunk reward aggregation: {reward_aggregation}')
-
-    is_dsrl_expo = (algo_name == 'dsrl_plus_expo')
 
     if is_resumed and resumed_replay_buffer is not None:
         replay_buffer = resumed_replay_buffer
@@ -162,9 +158,6 @@ def run_dsrl_online_rl(
         )
         if reward_aggregation == 'discounted_sum':
             example_transition['chunk_length'] = np.array(horizon_length)
-        if is_dsrl_expo:
-            example_transition['refined_actions'] = example_true_actions.copy()
-            example_transition['base_actions'] = example_true_actions.copy()
 
         replay_buffer = ReplayBuffer.create(
             example_transition, buffer_size,
@@ -201,7 +194,6 @@ def run_dsrl_online_rl(
     trajectory_buffer = []
     current_noise = None
     current_true_actions = None
-    current_base_actions = None
 
     if not is_resumed and hasattr(agent, 'reset_optimizers_with_lr'):
         agent = agent.reset_optimizers_with_lr()
@@ -221,36 +213,20 @@ def run_dsrl_online_rl(
 
     if is_resumed and resumed_online_step > 0:
         total_env_step = resumed_online_step
-        print(f"Resuming DSRL online loop at env step {total_env_step}")
+        print(f"Resuming GRACE online loop at env step {total_env_step}")
 
-    with tqdm.tqdm(total=online_steps, initial=total_env_step, desc="DSRL Online RL", dynamic_ncols=True) as pbar:
+    with tqdm.tqdm(total=online_steps, initial=total_env_step, desc="GRACE Online RL", dynamic_ncols=True) as pbar:
         while total_env_step < online_steps:
             previous_env_step = total_env_step
             online_rng, key = jax.random.split(online_rng)
 
             if len(action_queue) == 0:
                 if total_env_step >= start_training:
-                    if is_dsrl_expo:
-                        online_rng, action_key = jax.random.split(online_rng)
-                        action_info = agent.sample_actions(
-                            observations=ob, rng=action_key,
-                            deterministic=False, return_info=True)
-                        action = action_info['actions']
-                        current_noise = np.array(action_info['noise']).flatten()
-                        current_base_actions = np.array(action_info['base_actions']).flatten()
-                    else:
-                        noise = agent.sample_noise(observations=ob, rng=key)
-                        current_noise = np.array(noise).flatten()
-                        action = agent.noise_to_actions_public(ob, noise)
+                    noise = agent.sample_noise(observations=ob, rng=key)
                 else:
                     noise = jax.random.normal(key, (noise_dim,))
-                    current_noise = np.array(noise).flatten()
-                    if is_dsrl_expo:
-                        base_actions = agent.noise_to_actions_public(ob, noise)
-                        action = base_actions
-                        current_base_actions = np.array(base_actions).flatten()
-                    else:
-                        action = agent.noise_to_actions_public(ob, noise)
+                current_noise = np.array(noise).flatten()
+                action = agent.noise_to_actions_public(ob, noise)
 
                 current_true_actions = np.array(action).flatten()
                 action_chunk = np.array(action).reshape(-1, action_dim)
@@ -304,9 +280,6 @@ def run_dsrl_online_rl(
             )
             if reward_aggregation == 'discounted_sum':
                 transition['chunk_length'] = len(reward_all)
-            if is_dsrl_expo:
-                transition['refined_actions'] = current_true_actions
-                transition['base_actions'] = current_base_actions
 
             trajectory_buffer.append(transition)
 
@@ -327,7 +300,6 @@ def run_dsrl_online_rl(
                 action_queue = []
                 current_noise = None
                 current_true_actions = None
-                current_base_actions = None
             else:
                 ob = next_ob
 
@@ -435,5 +407,5 @@ def run_dsrl_online_rl(
     logger.log(dict(env_steps=total_env_step, gradient_updates=gradient_updates,
                     critic_gradient_updates=critic_gradient_updates, decoder_updates=0), 'online_budget', step=log_step)
     save_agent(agent, save_dir, log_step)
-    print(f"DSRL online RL training complete. Final log_step: {log_step}")
+    print(f"GRACE online RL training complete. Final log_step: {log_step}")
     return agent, log_step, eval_info, replay_buffer
