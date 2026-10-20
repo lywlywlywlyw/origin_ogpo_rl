@@ -1,5 +1,6 @@
 import copy
 import math
+from functools import partial
 from typing import Any, Tuple
 
 import flax
@@ -31,10 +32,11 @@ from ogpo.agents.modules.pg_helper import (
 class GRACEAgent(flax.struct.PyTreeNode):
     """DSRL with action-Q distillation and input-sensitivity diagnostics.
 
-    The actor and latent critic operate in noise space; the actor outputs noise
-    in [-action_magnitude, action_magnitude]. The frozen flow maps it to actions.
+    The actor and latent critic operate in noise space. Encoder outputs are
+    tanh-bounded or projected onto the LPS sphere of radius sqrt(noise_dim).
+    The frozen flow maps the resulting latent to actions.
     The action critic learns chunk returns via TD. The latent critic regresses
-    onto its values at actions decoded from standard Gaussian noise.
+    onto its values at actions decoded from the configured latent prior.
     """
 
     rng: Any
@@ -45,10 +47,11 @@ class GRACEAgent(flax.struct.PyTreeNode):
     config: Any = nonpytree_field()
 
     def critic_loss(self, batch, grad_params, rng):
-        # Distill the online action critic at fresh z ~ N(0, I), rather than
-        # bootstrapping Q(s, z) from rewards or its own target network.
+        # Use the same latent prior as the decoder, including sphere projection.
         noises = jax.random.normal(rng, batch['actions'].shape, dtype=batch['actions'].dtype)
-        actions = self.noise_to_actions_public(batch['observations'], noises)
+        noises = self.constrain_encoder_output(noises)
+        actions = self.noise_to_actions_public(
+            batch['observations'], noises, noises_constrained=True)
         target_q = jax.lax.stop_gradient(self._aggregate_q(
             self.action_critic_network.select('critic')(
                 batch['observations'], actions=actions)))
@@ -71,7 +74,9 @@ class GRACEAgent(flax.struct.PyTreeNode):
         _, sample_rng = jax.random.split(rng)
         dist = self.actor_network.select('actor')(batch['next_observations'])
         next_z, log_probs = dist.sample_and_log_prob(seed=sample_rng)
-        next_a = self.noise_to_actions_public(batch['next_observations'], next_z)
+        next_z = self.constrain_encoder_output(next_z)
+        next_a = self.noise_to_actions_public(
+            batch['next_observations'], next_z, noises_constrained=True)
         next_q = self._aggregate_q(self.action_critic_network.select('target_critic')(
             batch['next_observations'], actions=next_a))
         if self.config['entropy_backup']:
@@ -133,6 +138,9 @@ class GRACEAgent(flax.struct.PyTreeNode):
         rng, sample_rng = jax.random.split(rng)
         dist = self.actor_network.select('actor')(batch['observations'], params=grad_params)
         actions, log_probs = dist.sample_and_log_prob(seed=sample_rng)
+        # Entropy regularizes the pre-projection Gaussian, not the projected
+        # latent distribution. The Q objective uses the constrained latent.
+        actions = self.constrain_encoder_output(actions)
 
         qs = self.critic_network.select('critic')(batch['observations'], actions=actions)
         if self.config['q_agg'] == 'min':
@@ -151,7 +159,7 @@ class GRACEAgent(flax.struct.PyTreeNode):
         return total_loss, {
             'total_loss': total_loss, 'actor_loss': actor_loss, 'temp_loss': temp_loss,
             'log_probs_mean': log_probs.mean(), 'entropy': -log_probs.mean(),
-            'q_actor_mean': q.mean(), 'temp': temp, 'actor_mode': dist.mode().mean(),
+            'q_actor_mean': q.mean(), 'temp': temp, 'actor_mode': self.constrain_encoder_output(dist.mode()).mean(),
         }
 
     def actor_total_loss(self, batch, grad_params, rng):
@@ -162,7 +170,8 @@ class GRACEAgent(flax.struct.PyTreeNode):
     def actor_bc_loss(self, batch, grad_params, rng):
         successful_noise = batch["actions"]
         dist = self.actor_network.select('actor')(batch['observations'], params=grad_params)
-        actor_noise = dist.mode() if hasattr(dist, 'mode') else dist.mean()
+        actor_noise = self.constrain_encoder_output(
+            dist.mode() if hasattr(dist, 'mode') else dist.mean())
         bc_loss_unweighted = jnp.mean(jnp.square(actor_noise - successful_noise))
         bc_loss = self.config["bc_coeff"] * bc_loss_unweighted
 
@@ -314,27 +323,26 @@ class GRACEAgent(flax.struct.PyTreeNode):
             agent, infos = jax.lax.scan(scan_fn, self, (batch, batch_success))
         return agent, jax.tree_util.tree_map(lambda x: x.mean(), infos)
 
-    @jax.jit
+    def constrain_encoder_output(self, latent):
+        """Match LPS ActorVectorField's sphere branch, including its epsilon."""
+        if not self.config.get('encoder_sphere_limit', False):
+            return latent
+        sq_sum = jnp.sum(jnp.square(latent), axis=-1, keepdims=True)
+        return latent / jnp.sqrt(sq_sum + 1e-6) * jnp.sqrt(latent.shape[-1])
+
+    @partial(jax.jit, static_argnames=('deterministic',))
     def sample_noise(self, observations, rng=None, deterministic=False):
         dist = self.actor_network.select('actor')(observations)
         if deterministic:
-            return dist.mode() if hasattr(dist, 'mode') else dist.mean()
-        return dist.sample(seed=rng)
-
-    @jax.jit
-    def sample_actions(self, observations, rng=None, deterministic=False):
-        dist = self.actor_network.select('actor')(observations)
-        if deterministic:
-            actions = dist.mode() if hasattr(dist, 'mode') else dist.mean()
+            latent = dist.mode() if hasattr(dist, 'mode') else dist.mean()
         else:
-            actions = dist.sample(seed=rng)
+            latent = dist.sample(seed=rng)
+        return self.constrain_encoder_output(latent)
 
-        if self.config["noise_chunk_length"] > 0:
-            assert self.config["noise_chunk_length"] == 1
-            actions = jnp.concatenate([actions] * self.config["horizon_length"], axis=-1)
-
-        actions = self.compute_flow_actions(observations, actions)
-        return actions
+    @partial(jax.jit, static_argnames=('deterministic',))
+    def sample_actions(self, observations, rng=None, deterministic=False):
+        latent = self.sample_noise(observations, rng, deterministic=deterministic)
+        return self.noise_to_actions_public(observations, latent, noises_constrained=True)
 
     @jax.jit
     def add_decoder_noise(self, actions, noise_rng):
@@ -348,12 +356,14 @@ class GRACEAgent(flax.struct.PyTreeNode):
         sample = jnp.clip(sample, center - radius, center + radius)
         return jnp.clip(sample, -1.0, 1.0)
 
-    @jax.jit
-    def noise_to_actions_public(self, observations, actor_noise):
+    @partial(jax.jit, static_argnames=('noises_constrained',))
+    def noise_to_actions_public(self, observations, actor_noise, noises_constrained=False):
+        if not noises_constrained:
+            actor_noise = self.constrain_encoder_output(actor_noise)
         if self.config["noise_chunk_length"] > 0:
             assert self.config["noise_chunk_length"] == 1
             actor_noise = jnp.concatenate([actor_noise] * self.config["horizon_length"], axis=-1)
-        return self.compute_flow_actions(observations, actor_noise)
+        return self.compute_flow_actions(observations, actor_noise, noises_constrained=True)
 
     @jax.jit
     def sample_actions_normal(self, observations, rng=None):
@@ -375,8 +385,9 @@ class GRACEAgent(flax.struct.PyTreeNode):
             q_agg=self.config['q_agg'], is_encoded=is_encoded,
         )
 
-    @jax.jit
-    def compute_flow_actions(self, observations, noises=None, params=None, rng=None):
+    @partial(jax.jit, static_argnames=('noises_constrained',))
+    def compute_flow_actions(self, observations, noises=None, params=None, rng=None,
+                             noises_constrained=False):
         add_batch_dim = False
         if (self.config['encoder'] is not None and observations.ndim == 3) or \
            (self.config['encoder'] is None and observations.ndim == 1):
@@ -385,7 +396,13 @@ class GRACEAgent(flax.struct.PyTreeNode):
                 noises = noises[None, ...]
             add_batch_dim = True
 
-        act_dim = self.config['noise_dim']
+        act_dim = self.config['action_dim'] * (
+            self.config['horizon_length'] if self.config['action_chunking'] else 1)
+        if noises is None:
+            noises = jax.random.normal(rng, (observations.shape[0], act_dim))
+            noises_constrained = False
+        if not noises_constrained:
+            noises = self.constrain_encoder_output(noises)
 
         if self.config['encoder'] is not None:
             if params is not None:
@@ -470,7 +487,7 @@ class GRACEAgent(flax.struct.PyTreeNode):
     @classmethod
     def create(cls, seed, ex_observations, ex_actions, config):
         config = dict(config)
-        config.setdefault('encoder_normal_init', False)
+        config.setdefault('encoder_sphere_limit', False)
         config.setdefault('decoder_add_noise', False)
         config.setdefault('decoder_noise_std', 0.09)
         config.setdefault('decoder_noise_clip', 3.0)
@@ -536,7 +553,7 @@ class GRACEAgent(flax.struct.PyTreeNode):
             action_dim=noise_dim,
             layer_norm=config['actor_layer_norm'],
             encoder=encoders.get('actor'),
-            tanh_squash=not config['encoder_normal_init'],
+            tanh_squash=not config['encoder_sphere_limit'],
             state_dependent_std=True,
             low=-config["action_magnitude"],
             high=config["action_magnitude"],
@@ -615,12 +632,6 @@ class GRACEAgent(flax.struct.PyTreeNode):
 
         rng, actor_rng, critic_rng, bc_flow_rng = jax.random.split(rng, 4)
         actor_params = actor_net_def.init(actor_rng, **actor_args)['params']
-        if config['encoder_normal_init']:
-            # An unsquashed, state-independent N(0, I) before the first update.
-            # Initialize before creating Adam state; both heads remain trainable.
-            for head in ('mean_net', 'log_std_net'):
-                actor_params['modules_actor'][head] = jax.tree.map(
-                    jnp.zeros_like, actor_params['modules_actor'][head])
         critic_params = critic_net_def.init(critic_rng, **critic_args)['params']
         bc_flow_params = bc_flow_net_def.init(bc_flow_rng, **bc_flow_args)['params']
 

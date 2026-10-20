@@ -5,8 +5,8 @@ experiment:
   wandb_name: grace_square_shared_ogpo_bc
 agent:
   agent_name: grace
-  # True: unsquashed encoder with zero mean/log-std heads, initially N(0, I).
-  encoder_normal_init: true
+  # True: skip encoder tanh; use the LPS sphere for ALL decoder initial latents.
+  encoder_sphere_limit: false
   gradient_delta_a: null
   gradient_delta_z: null
   gradient_ratio_epsilon: 1.0e-8

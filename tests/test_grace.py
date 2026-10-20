@@ -20,7 +20,8 @@ from ogpo.utils.config_loader import load_config, config_to_agent_dict
 
 def make_pair():
     config = config_to_agent_dict(load_config('grace_ogpo_square_shared'))
-    config.update(actor_hidden_dims=(8, 8), value_hidden_dims=(8, 8), num_qs=2)
+    config.update(actor_hidden_dims=(8, 8), value_hidden_dims=(8, 8), num_qs=2,
+                  encoder_sphere_limit=True)
     dsrl = DSRLBestOfNAgent.create(1, jnp.zeros(3), jnp.zeros(2), dict(config))
     grace = GRACEAgent.create(1, jnp.zeros(3), jnp.zeros(2), dict(config))
     return dsrl, grace
@@ -42,39 +43,87 @@ def assert_tree_equal(test, a, b):
 
 
 class GraceTests(unittest.TestCase):
-    def test_encoder_normal_init_is_standard_normal_and_trainable(self):
-        _, baseline = make_pair()
-        config = dict(baseline.config, encoder_normal_init=True, action_magnitude=.5)
-        grace = GRACEAgent.create(1, jnp.zeros(3), jnp.zeros(2), config)
+    def test_encoder_sphere_matches_lps_and_sampling_paths(self):
+        _, grace = make_pair()
+        self.assertTrue(grace.config['encoder_sphere_limit'])
         observations = jax.random.normal(jax.random.PRNGKey(31), (128, 3)) * 10
-        dist = grace.actor_network.select('actor')(observations)
-        np.testing.assert_array_equal(dist.mean(), np.zeros((128, 8)))
-        np.testing.assert_array_equal(dist.stddev(), np.ones((128, 8)))
-        for head in ('mean_net', 'log_std_net'):
-            for leaf in jax.tree.leaves(grace.actor_network.params['modules_actor'][head]):
-                np.testing.assert_array_equal(leaf, np.zeros_like(leaf))
         key = jax.random.PRNGKey(32)
+        dist = grace.actor_network.select('actor')(observations)
+        raw = dist.sample(seed=key)
+        # No tanh or action_magnitude rescaling before the LPS projection.
+        np.testing.assert_allclose(dist.mean(), dist.mode())
+        expected = raw / jnp.sqrt(jnp.sum(raw ** 2, axis=-1, keepdims=True) + 1e-6) * jnp.sqrt(8.)
         samples = grace.sample_noise(observations, key)
+        np.testing.assert_allclose(samples, expected, atol=1e-6)
+        np.testing.assert_allclose(jnp.linalg.norm(samples, axis=-1), jnp.sqrt(8.), atol=2e-5)
         self.assertTrue(np.any(np.abs(samples) > 1.))
-        np.testing.assert_array_equal(samples, dist.sample(seed=key))
-        expected_log_probs = -.5 * jnp.sum(samples ** 2 + jnp.log(2 * jnp.pi), axis=-1)
-        np.testing.assert_allclose(dist.log_prob(samples), expected_log_probs, rtol=1e-6)
-        np.testing.assert_array_equal(dist.mode(), np.zeros((128, 8)))
+        np.testing.assert_allclose(grace.sample_actions(observations, key),
+            grace.noise_to_actions_public(observations, expected), atol=1e-6)
+        mode = grace.constrain_encoder_output(dist.mode())
+        np.testing.assert_allclose(grace.sample_noise(observations, deterministic=True), mode, atol=1e-6)
+        np.testing.assert_allclose(grace.sample_actions(observations, deterministic=True),
+            grace.noise_to_actions_public(observations, mode), atol=1e-6)
+        zero = grace.constrain_encoder_output(jnp.zeros((2, 8)))
+        np.testing.assert_array_equal(zero, np.zeros((2, 8)))
+        for head in ('mean_net', 'log_std_net'):
+            self.assertTrue(any(np.any(np.asarray(leaf) != 0) for leaf in
+                jax.tree.leaves(grace.actor_network.params['modules_actor'][head])))
+
+    def test_all_decoder_entry_points_use_sphere_prior(self):
+        _, grace = make_pair()
+        obs = jnp.ones((3, 3))
+        key = jax.random.PRNGKey(41)
+        raw = 7 * jax.random.normal(key, (3, 8))
+        expected = grace.constrain_encoder_output(raw)
+        # Inspect the actual ODE starting point, not the clipped decoded action.
+        with jax.disable_jit(), patch('ogpo.agents.grace.sample_flow_actions_ode',
+                side_effect=lambda **kwargs: kwargs['noises']):
+            np.testing.assert_allclose(grace.compute_flow_actions(obs, raw), expected)
+            np.testing.assert_allclose(grace.noise_to_actions_public(obs, raw), expected)
+            prior = grace.constrain_encoder_output(jax.random.normal(key, (3, 8)))
+            np.testing.assert_allclose(grace.compute_flow_actions(obs, rng=key), prior)
+            np.testing.assert_allclose(grace.sample_actions_normal(obs, key), prior)
+
+    def test_encoder_sphere_used_by_actor_and_td_target(self):
+        _, grace = make_pair()
+        data = jax.tree.map(lambda x: x[0], batch())
+        rng = jax.random.PRNGKey(32)
+        _, key = jax.random.split(rng)
+        dist = grace.actor_network.select('actor')(data['observations'])
+        raw, log_probs = dist.sample_and_log_prob(seed=key)
+        z = grace.constrain_encoder_output(raw)
+        q = grace._aggregate_q(grace.critic_network.select('critic')(
+            data['observations'], actions=z))
+        _, info = grace.actor_loss(data, grace.actor_network.params, rng)
+        expected = jnp.mean(grace.actor_network.select('temp')() * log_probs - q)
+        np.testing.assert_allclose(info['actor_loss'], expected, rtol=1e-6)
+        next_z = grace.sample_noise(data['next_observations'], key)
+        next_a = grace.noise_to_actions_public(data['next_observations'], next_z)
+        next_q = grace._aggregate_q(grace.action_critic_network.select('target_critic')(
+            data['next_observations'], actions=next_a))
+        target = jnp.clip(data['rewards'] + .99 ** data['chunk_length'] * data['masks'] * next_q,
+                          -500., 500.)
+        _, info = grace.action_critic_loss(data, grace.action_critic_network.params, rng)
+        np.testing.assert_allclose(info['action_critic/target_q_mean'], target.mean(), rtol=1e-6)
+        mode = grace.constrain_encoder_output(dist.mode())
+        loss, _ = grace.actor_bc_loss(data, grace.actor_network.params, rng)
+        np.testing.assert_allclose(loss, grace.config['bc_coeff'] *
+                                   jnp.mean((mode - data['actions']) ** 2), rtol=1e-6)
         updated, metrics = grace.batch_update(batch())
         self.assertTrue(np.isfinite(metrics['actor/total_loss']))
-        self.assertTrue(any(np.any(np.asarray(leaf) != 0) for leaf in jax.tree.leaves(
-            updated.actor_network.params['modules_actor']['mean_net'])))
+        self.assertTrue(all(np.isfinite(np.asarray(leaf)).all() for leaf in
+                            jax.tree.leaves(updated.actor_network.params)))
 
-    def test_encoder_normal_init_disabled_preserves_original_policy(self):
-        dsrl, grace = make_pair()
-        self.assertFalse(grace.config['encoder_normal_init'])
+    def test_encoder_sphere_disabled_preserves_original_policy(self):
+        dsrl, baseline = make_pair()
+        config = dict(baseline.config, encoder_sphere_limit=False)
+        grace = GRACEAgent.create(1, jnp.zeros(3), jnp.zeros(2), config)
         observations = jax.random.normal(jax.random.PRNGKey(33), (128, 3))
         key = jax.random.PRNGKey(34)
         np.testing.assert_array_equal(grace.sample_noise(observations, key),
                                       dsrl.sample_noise(observations, key))
         self.assertTrue(np.all(np.abs(grace.sample_noise(observations, key)) <= 1.))
-        config = dict(grace.config)
-        config.pop('encoder_normal_init')
+        config.pop('encoder_sphere_limit')
         default = GRACEAgent.create(1, jnp.zeros(3), jnp.zeros(2), config)
         np.testing.assert_array_equal(default.sample_noise(observations, key),
                                       grace.sample_noise(observations, key))
@@ -152,7 +201,7 @@ class GraceTests(unittest.TestCase):
         position = 0
         for index in range(replay.size):
             online_rng, latent_rng = jax.random.split(online_rng)
-            z = jax.random.normal(latent_rng, (8,))
+            z = grace.constrain_encoder_output(jax.random.normal(latent_rng, (8,)))
             clean = grace.noise_to_actions_public(jnp.zeros(3), z)
             online_rng, noise_rng = jax.random.split(online_rng)
             expected = grace.add_decoder_noise(clean, noise_rng)
@@ -190,11 +239,12 @@ class GraceTests(unittest.TestCase):
                 self.assertTrue(np.isfinite(metrics['sensitivity/' + key]))
         self.assertEqual(int(grace.critic_network.step), 9)  # 2 scans * 2 Q steps * 2 calls + init
 
-    def test_gaussian_distillation_target_and_stopped_teacher_gradient(self):
+    def test_prior_distillation_target_and_stopped_teacher_gradient(self):
         _, grace = make_pair()
         data = jax.tree.map(lambda x: x[0], batch())
         rng = jax.random.PRNGKey(19)
-        z = jax.random.normal(rng, data['actions'].shape, dtype=data['actions'].dtype)
+        z = grace.constrain_encoder_output(jax.random.normal(
+            rng, data['actions'].shape, dtype=data['actions'].dtype))
         a = grace.noise_to_actions_public(data['observations'], z)
         target = grace._aggregate_q(grace.action_critic_network.select('critic')(
             data['observations'], actions=a))

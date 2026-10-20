@@ -225,8 +225,13 @@ def run_grace_online_rl(
                     noise = agent.sample_noise(observations=ob, rng=key)
                 else:
                     noise = jax.random.normal(key, (noise_dim,))
+                    if config.get('encoder_sphere_limit', False):
+                        noise = agent.constrain_encoder_output(noise)
                 current_noise = np.array(noise).flatten()
-                action = agent.noise_to_actions_public(ob, noise)
+                if config.get('encoder_sphere_limit', False):
+                    action = agent.noise_to_actions_public(ob, noise, noises_constrained=True)
+                else:
+                    action = agent.noise_to_actions_public(ob, noise)
                 if config.get('decoder_add_noise', False):
                     online_rng, noise_rng = jax.random.split(online_rng)
                     action = agent.add_decoder_noise(action, noise_rng)
