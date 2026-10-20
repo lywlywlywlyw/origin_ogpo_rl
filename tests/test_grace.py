@@ -86,6 +86,7 @@ class GraceTests(unittest.TestCase):
 
     def test_encoder_sphere_used_by_actor_and_td_target(self):
         _, grace = make_pair()
+        grace = grace.replace(config=dict(grace.config, delete_sac_entropy=False))
         data = jax.tree.map(lambda x: x[0], batch())
         rng = jax.random.PRNGKey(32)
         _, key = jax.random.split(rng)
@@ -113,6 +114,33 @@ class GraceTests(unittest.TestCase):
         self.assertTrue(np.isfinite(metrics['actor/total_loss']))
         self.assertTrue(all(np.isfinite(np.asarray(leaf)).all() for leaf in
                             jax.tree.leaves(updated.actor_network.params)))
+
+    def test_delete_sac_entropy_independent_of_sphere(self):
+        _, baseline = make_pair()
+        data = jax.tree.map(lambda x: x[0], batch())
+        rng = jax.random.PRNGKey(32)
+        for sphere in (False, True):
+            for delete_entropy in (False, True):
+                with self.subTest(sphere=sphere, delete_entropy=delete_entropy):
+                    config = dict(baseline.config, encoder_sphere_limit=sphere,
+                                  delete_sac_entropy=delete_entropy)
+                    agent = GRACEAgent.create(1, jnp.zeros(3), jnp.zeros(2), config)
+                    loss_fn = lambda p: agent.actor_loss(data, p, rng)
+                    (_, info), grads = jax.value_and_grad(loss_fn, has_aux=True)(
+                        agent.actor_network.params)
+                    temp_grads = jax.tree.leaves(grads['modules_temp'])
+                    updated, _ = agent.actor_network.apply_loss_fn(loss_fn)
+                    if delete_entropy:
+                        np.testing.assert_allclose(info['actor_loss'], -info['q_actor_mean'])
+                        self.assertEqual(float(info['temp_loss']), 0.)
+                        self.assertTrue(all(np.all(np.asarray(g) == 0) for g in temp_grads))
+                        assert_tree_equal(self, updated.params['modules_temp'],
+                                          agent.actor_network.params['modules_temp'])
+                    else:
+                        np.testing.assert_allclose(info['actor_loss'],
+                            info['temp'] * info['log_probs_mean'] - info['q_actor_mean'],
+                            rtol=1e-5)
+                        self.assertTrue(any(np.any(np.asarray(g) != 0) for g in temp_grads))
 
     def test_encoder_sphere_disabled_preserves_original_policy(self):
         dsrl, baseline = make_pair()

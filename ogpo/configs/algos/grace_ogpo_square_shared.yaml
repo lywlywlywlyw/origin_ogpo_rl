@@ -7,6 +7,8 @@ agent:
   agent_name: grace
   # True: skip encoder tanh; use the LPS sphere for ALL decoder initial latents.
   encoder_sphere_limit: false
+  # Independently disable SAC actor entropy and temperature (alpha) loss.
+  delete_sac_entropy: false
   gradient_delta_a: null
   gradient_delta_z: null
   gradient_ratio_epsilon: 1.0e-8

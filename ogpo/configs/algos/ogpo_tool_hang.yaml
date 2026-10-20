@@ -1,0 +1,124 @@
+# Full offline BC followed by 2,000,000 online environment steps.
+# Dataset: /root/datasets/tool_hang/ph/low_dim_v15.hdf5
+# Set ROBOMIMIC_DATASET_ROOT=/root/datasets when launching.
+# Based on the existing task shell script; BC early stopping is disabled,
+# with a constant BC learning rate and periodic offline checkpoints.
+_base_: ogpo.yaml
+experiment:
+  project: OGPO
+  run_group: toolhang
+  run_name: ogpo_toolhang
+  wandb_name: ogpo_toolhang
+  seed: 1
+  log: true
+  save_dir: exp/ogpo
+env:
+  name: tool_hang-ph-low_dim
+  post_success_steps: 0
+training:
+  bc_pi_steps: 500000
+  calql_steps: 0
+  q_warmup_steps: 0
+  bc_refine_steps: 0
+  online_steps: 2000000
+  gpu_mode: single
+  force_jax_sync: true
+buffer:
+  start_training: 40000
+  utd_warmup: 1
+  utd_online: 1
+  utd_q: 1
+  utd_pi: 1
+  offline_ratio: 0.0
+  size: 2000000
+eval:
+  n_eval_envs: 32
+  eval_episodes: 2
+  plot_q_vs_mc: false
+intervals:
+  log_interval: 5000
+  eval_interval: 20000
+  eval_interval_bc: 10000
+  save_interval: 500000
+  save_interval_bc: 100000
+bc:
+  clip_bc: false
+  clip_bc_threshold: 0.45
+  clip_bc_wrt: SDE
+success_buffer:
+  use_success_buffer: true
+agent:
+  use_success_buffer_q: false
+  horizon_length: 8
+  discount: 0.999
+  tau: 0.05
+  actor_tau: 0.005
+  best_of_n: 8
+  num_qs: 10
+  q_agg: mean
+  subsample_bon: true
+  cql_alpha: 5.0
+  cql_temp: 1.0
+  cql_n_actions: 10
+  calql_q_subsample: 2
+  flow_steps: 10
+  ft_flow_steps: 10
+  time_embedding: sinusoidal
+  time_embedding_dim: 32
+  bc_coeff: 1.0
+  adv_strategy: conservative
+  awr_beta: 10
+  ppo_batch_size: 256
+  clip_epsilon: 0.01
+  entropy_coeff: 0.0
+  group_num_samples: 32
+  use_bc_regularization: true
+  error_correct_ode_to_sde: false
+  use_denoiser: false
+  use_constant_noise: false
+  use_tapered_noise: true
+  error_correct_sde_to_ode: true
+  constant_noise_std: 0.05
+  min_noise_std: 0.01
+  max_noise_std: 0.01
+  actor_backbone: mlp
+  critic_backbone: mlp
+  actor_layer_norm: false
+  layer_norm: true
+  actor_hidden_dims:
+  - 512
+  - 512
+  - 512
+  - 512
+  - 512
+  value_hidden_dims:
+  - 512
+  - 512
+  - 512
+  - 512
+  - 512
+  tf_pi_layers: 8
+  tf_pi_embed_dim: 256
+  tf_pi_heads: 4
+  tf_q_layers: 8
+  tf_q_embed_dim: 256
+  tf_q_heads: 4
+  chi_po: false
+  chi_po_beta_base: 0.1
+  tau_slow: 0.0005
+  chi_po_q_std_target: 1.0
+  chi_po_ensemble_alpha: 5.0
+  chi_po_R_max: 100.0
+  fwd_kl_reg: false
+  fwd_kl_bc_coeff: 0.1
+  use_constant_scheduler_for_bc: true
+checkpoint:
+  restore_actor_path: null
+  restore_critic_path: null
+  ep_resume: 0
+  resume: false
+  restore_bc_flow_path: null
+dataset:
+  p_aug: 0.0
+  num_offline_trajs: -1
+  proportion: 1.0

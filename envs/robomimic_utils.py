@@ -87,10 +87,10 @@ def _get_max_episode_length(env_name):
         return 300
     elif env_name.startswith("square"):
         return 400
-    elif env_name.startswith("transport"):
-        return 800
-    elif env_name.startswith("tool_hang"):
-        return 1000
+    elif env_name.startswith(("transport", "tool_hang")):
+        # v1.5 horizons depend on demonstration source (e.g. transport MH).
+        task, dataset_type, hdf5_type = env_name.split("-")
+        return DATASET_REGISTRY[task][dataset_type][hdf5_type]['horizon']
     else:
         raise ValueError(f"Unsupported environment: {env_name}")
 

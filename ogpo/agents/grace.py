@@ -137,9 +137,12 @@ class GRACEAgent(flax.struct.PyTreeNode):
     def actor_loss(self, batch, grad_params, rng):
         rng, sample_rng = jax.random.split(rng)
         dist = self.actor_network.select('actor')(batch['observations'], params=grad_params)
-        actions, log_probs = dist.sample_and_log_prob(seed=sample_rng)
-        # Entropy regularizes the pre-projection Gaussian, not the projected
-        # latent distribution. The Q objective uses the constrained latent.
+        delete_sac_entropy = self.config.get('delete_sac_entropy', False)
+        if delete_sac_entropy:
+            actions = dist.sample(seed=sample_rng)
+            log_probs = jnp.zeros(actions.shape[:-1], dtype=actions.dtype)
+        else:
+            actions, log_probs = dist.sample_and_log_prob(seed=sample_rng)
         actions = self.constrain_encoder_output(actions)
 
         qs = self.critic_network.select('critic')(batch['observations'], actions=actions)
@@ -149,11 +152,16 @@ class GRACEAgent(flax.struct.PyTreeNode):
             q = jnp.mean(qs, axis=0)
 
         temp = self.actor_network.select('temp')()
-        actor_loss = jnp.mean(temp * log_probs - q)
-
-        temp_param = self.actor_network.select('temp')(params=grad_params)
-        entropy = -jax.lax.stop_gradient(log_probs).mean()
-        temp_loss = (temp_param * (entropy - self.config['target_entropy'])).mean()
+        if delete_sac_entropy:
+            # Disable both actor entropy regularization and temperature learning.
+            actor_loss = -jnp.mean(q)
+            temp_loss = jnp.asarray(0., dtype=q.dtype)
+            entropy = jnp.asarray(0., dtype=q.dtype)
+        else:
+            actor_loss = jnp.mean(temp * log_probs - q)
+            temp_param = self.actor_network.select('temp')(params=grad_params)
+            entropy = -jax.lax.stop_gradient(log_probs).mean()
+            temp_loss = (temp_param * (entropy - self.config['target_entropy'])).mean()
 
         total_loss = actor_loss + temp_loss
         return total_loss, {
@@ -488,6 +496,7 @@ class GRACEAgent(flax.struct.PyTreeNode):
     def create(cls, seed, ex_observations, ex_actions, config):
         config = dict(config)
         config.setdefault('encoder_sphere_limit', False)
+        config.setdefault('delete_sac_entropy', False)
         config.setdefault('decoder_add_noise', False)
         config.setdefault('decoder_noise_std', 0.09)
         config.setdefault('decoder_noise_clip', 3.0)
