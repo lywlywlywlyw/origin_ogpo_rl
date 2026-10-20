@@ -11,3 +11,6 @@ agent:
   pss_num_probes: 64
   pss_delta: 0.05
   pss_probe_batch_size: 64
+  # Match DSRL+EXPO noise critic distillation settings.
+  lr_noise_critic: 3e-4
+  noise_critic_grad_steps: 10

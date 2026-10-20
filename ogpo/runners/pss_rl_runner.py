@@ -2,7 +2,8 @@
 
 The N probe states come from the existing Gaussian-policy warmup, not extra
 rollouts. Replay stores z (not the full noise or decoded action) as the SAC
-action. Full initial noise is retained only for warmup relabeling and diagnostics.
+action. Decoded action chunks train the action critic. Full initial noise is retained
+only for warmup relabeling and diagnostics.
 """
 
 import hashlib
@@ -81,7 +82,7 @@ def run_pss_online_rl(
     if kwargs.get('bc_refine_steps', 0) or kwargs.get('q_warmup_steps', 0):
         raise ValueError('PSS does not perform BC refinement or separate Q pretraining')
     if plot_q_vs_mc:
-        raise ValueError('Generic Q plots use physical actions; PSS critics require z')
+        raise ValueError('Q-vs-MC plotting is not implemented in the PSS runner')
     if not bool(agent.decoder_loaded):
         raise ValueError('PSS requires an explicitly restored offline BC flow checkpoint')
     if bool(agent.basis_ready):
@@ -133,7 +134,7 @@ def run_pss_online_rl(
     def learner_batch(batch):
         # Diagnostics must not enlarge the JIT update graph or learner action space.
         return {key: batch[key] for key in
-                ('observations', 'next_observations', 'actions', 'rewards',
+                ('observations', 'next_observations', 'actions', 'true_actions', 'rewards',
                  'masks', 'terminals', 'chunk_length')}
 
     raw, _ = env.reset(seed=seed + 10000)
@@ -147,10 +148,13 @@ def run_pss_online_rl(
     log_step, eval_info = start_step, {}
     eval_flags = _build_eval_flags(n_eval_envs, eval_episodes, discount, run_name, env_name)
     initial_actor_step, initial_critic_step = int(agent.actor_network.step), int(agent.critic_network.step)
+    initial_noise_critic_step = int(agent.noise_critic_network.step)
+    distill_steps = agent.config['noise_critic_grad_steps']
 
     def log_budget():
         logger.log(dict(env_steps=steps, gradient_updates=actor_updates,
-                        critic_gradient_updates=critic_updates, decoder_updates=0,
+                        critic_gradient_updates=critic_updates,
+                        noise_critic_gradient_updates=actor_updates * distill_steps, decoder_updates=0,
                         probe_env_steps=probe_env_steps,
                         probe_decoder_queries=n_probes * (dim + 1)),
                    'online_budget', step=log_step)
@@ -284,6 +288,8 @@ def run_pss_online_rl(
         raise RuntimeError('Recorded actor budget differs from actual optimizer steps')
     if int(agent.critic_network.step) - initial_critic_step != critic_updates:
         raise RuntimeError('Recorded critic budget differs from actual optimizer steps')
+    if int(agent.noise_critic_network.step) - initial_noise_critic_step != actor_updates * distill_steps:
+        raise RuntimeError('Recorded distillation budget differs from actual optimizer steps')
     if config.get('critic_updates_per_actor', 1) == 2 and critic_updates != 2 * actor_updates:
         raise RuntimeError('Critic update budget mismatch')
     log_budget()

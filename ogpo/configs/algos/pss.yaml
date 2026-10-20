@@ -17,6 +17,9 @@ success_buffer:
   use_success_buffer: false
 agent:
   agent_name: pss
+  # Match DSRL+EXPO noise critic distillation settings.
+  lr_noise_critic: 3e-4
+  noise_critic_grad_steps: 10
   pss_dim: 8
   pss_num_probes: 64
   pss_delta: 0.05

@@ -1,8 +1,9 @@
 """Principal Steering Subspaces (Ni et al., 2026), Sec. III, Eqs. (3)--(5).
 
 Only the latent SAC interface changes: the BC flow architecture and its weights
-are identical to the shared OGPO/DSRL decoder. SAC and the matched success-buffer
-updates reuse DSRL's losses; the actor/critic action width becomes k instead of D.
+are identical to the shared OGPO/DSRL decoder. The action critic learns TD
+values online; the k-dimensional steering critic only learns by distillation,
+following DSRL+EXPO's critic -> distillation -> SAC actor update order.
 """
 
 import copy
@@ -15,6 +16,7 @@ import numpy as np
 import optax
 
 from ogpo.agents.dsrl import DSRLBestOfNAgent
+from ogpo.agents.dsrl_plus_expo import DSRLEXPOAgent
 from ogpo.agents.modules.flax_utils import ModuleDict, TrainState
 from ogpo.networks import Actor, ActorVectorField, LogParam, Value
 from ogpo.networks.modules.time_embedding import SinusoidalTimeEmbedding
@@ -70,6 +72,7 @@ class PSSAgent(DSRLBestOfNAgent):
     Basis and readiness flags are pytree fields so checkpoints preserve them.
     """
 
+    noise_critic_network: TrainState
     steering_basis: Any = None
     response_eigenvalues: Any = None
     basis_ready: Any = None
@@ -138,10 +141,120 @@ class PSSAgent(DSRLBestOfNAgent):
         return self.compute_flow_actions(
             observations, noises=self.reconstruct_noise(z, complement_key))
 
+    def critic_loss(self, batch, grad_params, rng):
+        """DSRL TD MSE on executed actions, with entropy measured in z-space."""
+        sample_rng, complement_rng = jax.random.split(rng)
+        next_dist = self.actor_network.select('actor')(batch['next_observations'])
+        next_z, next_log_probs = next_dist.sample_and_log_prob(seed=sample_rng)
+        next_actions = self.compute_flow_actions(
+            batch['next_observations'],
+            noises=self.reconstruct_noise(next_z, complement_rng))
+        next_qs = self.critic_network.select('target_critic')(
+            batch['next_observations'], actions=next_actions)
+        next_q = (jnp.min(next_qs, axis=0) if self.config['q_agg'] == 'min'
+                  else jnp.mean(next_qs, axis=0))
+        temp = self.actor_network.select('temp')()
+        if self.config['entropy_backup']:
+            next_log_probs = jnp.clip(next_log_probs, -100, 100)
+            next_q = next_q - temp * next_log_probs
+        target_q = jax.lax.stop_gradient(jnp.clip(
+            batch['rewards']
+            + self.config['discount'] ** batch.get('chunk_length', self.config['horizon_length'])
+            * batch['masks'] * next_q, -500., 500.))
+        q = self.critic_network.select('critic')(
+            batch['observations'], actions=batch['true_actions'], params=grad_params)
+        loss = jnp.mean((q - target_q) ** 2)
+        info = dict(critic_loss=loss, q_mean=q.mean(), q_max=q.max(), q_min=q.min(),
+                    target_q_mean=target_q.mean(), temp=temp,
+                    next_actions_mean=next_actions.mean(), next_actions_min=next_actions.min(),
+                    next_actions_max=next_actions.max(), next_actions_std=next_actions.std(),
+                    rewards_mean=batch['rewards'].mean(), rewards_min=batch['rewards'].min(),
+                    rewards_max=batch['rewards'].max())
+        if self.config['entropy_backup']:
+            info['next_log_probs_mean'] = next_log_probs.mean()
+        return loss, info
+
+    # DSRL+EXPO's SAC loss evaluates the distilled critic and clips log-probs.
+    actor_loss = DSRLEXPOAgent.actor_loss
+    noise_critic_total_loss = DSRLEXPOAgent.noise_critic_total_loss
+
+    def noise_critic_distill_loss(self, batch, grad_params, rng):
+        """Regress each Q(s,z) head onto Q(s, decode(V_k z + V_perp eps)).
+
+        As in DSRL+EXPO, use fresh tanh-normal samples instead of replay noise.
+        PSS's actor already includes action_magnitude in its output bounds, so
+        the same scale is applied to z here. A fresh complement gives an unbiased
+        sample of the conditional teacher value for this z.
+        """
+        noise_rng, complement_rng = jax.random.split(rng)
+        z = self.config['action_magnitude'] * jnp.tanh(jax.random.normal(
+            noise_rng, (batch['observations'].shape[0], self.config['pss_dim'])))
+        actions = self.compute_flow_actions(
+            batch['observations'], noises=self.reconstruct_noise(z, complement_rng))
+        target_qs = jax.lax.stop_gradient(self.critic_network.select('critic')(
+            batch['observations'], actions=actions))
+        pred_qs = self.noise_critic_network.select('noise_critic')(
+            batch['observations'], actions=z, params=grad_params)
+        loss = jnp.mean((pred_qs - target_qs) ** 2)
+        return loss, dict(noise_critic_distill_loss=loss,
+                          noise_critic_pred_q_mean=pred_qs.mean(),
+                          noise_critic_target_q_mean=target_qs.mean())
+
+    @staticmethod
+    def _online_update(agent, batch, batch_success=None, success_flag=False):
+        new_rng, critic_rng, extra_rng, distill_rng, actor_rng, bc_rng = jax.random.split(agent.rng, 6)
+        critic_state, critic_info = agent.critic_network.apply_loss_fn(
+            lambda p: agent.critic_total_loss(batch, p, critic_rng))
+        agent.target_update(critic_state, 'critic')
+        agent = agent.replace(critic_network=critic_state)
+        agent = agent._extra_critic_update(agent, batch, batch_success, success_flag, extra_rng)
+
+        # Distill from the updated action critic before updating the SAC actor.
+        def distill_step(state, key):
+            return state.apply_loss_fn(lambda p: agent.noise_critic_total_loss(batch, p, key))
+        keys = jax.random.split(distill_rng, agent.config['noise_critic_grad_steps'])
+        noise_state, noise_infos = jax.lax.scan(distill_step, agent.noise_critic_network, keys)
+        agent = agent.replace(noise_critic_network=noise_state)
+
+        def actor_loss_fn(p):
+            loss, info = agent.actor_total_loss(batch, p, actor_rng)
+            if batch_success is not None:
+                def add_bc():
+                    bc_loss, bc_info = agent.actor_bc_loss(batch_success, p, bc_rng)
+                    return loss + bc_loss, {**info, **bc_info}
+
+                def no_bc():
+                    bc_info = {key: jnp.asarray(0.) for key in (
+                        'actor_bc_loss', 'actor_bc_loss_unweighted', 'actor_noise_mean',
+                        'actor_noise_std', 'successful_noise_mean', 'successful_noise_std',
+                        'bc_mse_error')}
+                    return loss, {**info, **bc_info}
+                return jax.lax.cond(success_flag, add_bc, no_bc)
+            return loss, info
+
+        actor_state, actor_info = agent.actor_network.apply_loss_fn(actor_loss_fn)
+        noise_info = jax.tree.map(lambda x: x[-1], noise_infos)
+        return agent.replace(actor_network=actor_state, rng=new_rng), {
+            **actor_info, **critic_info, **noise_info}
+
+    @staticmethod
+    def _update(agent, batch):
+        return agent._online_update(agent, batch)
+
+    @staticmethod
+    def _update_with_bc(agent, batch_tuple):
+        return agent._online_update(agent, *batch_tuple)
+
     def batch_update(self, batch, batch_success=None, success_flag=False):
         self._require_basis()
-        if batch['actions'].shape[-1] != self.config['pss_dim']:
-            raise ValueError('PSS replay actions must be k-dimensional z coordinates')
+        for replay_batch in (batch, batch_success):
+            if replay_batch is None:
+                continue
+            if replay_batch['actions'].shape[-1] != self.config['pss_dim']:
+                raise ValueError('PSS replay actions must be k-dimensional z coordinates')
+            if ('true_actions' not in replay_batch
+                    or replay_batch['true_actions'].shape[-1] != self.config['noise_dim']):
+                raise ValueError('PSS replay true_actions must contain the full decoded action chunk')
         return super().batch_update(batch, batch_success, success_flag)
 
     def bc_update(self, batch):
@@ -151,15 +264,20 @@ class PSSAgent(DSRLBestOfNAgent):
     def create(cls, seed, ex_observations, ex_actions, config):
         config = dict(config)
         defaults = dict(pss_dim=8, pss_num_probes=64, pss_delta=0.05,
-                        pss_probe_batch_size=64, critic_updates_per_actor=1)
+                        pss_probe_batch_size=64, critic_updates_per_actor=1,
+                        noise_critic_grad_steps=10, lr_noise_critic=3e-4)
         for key, value in defaults.items():
-            config.setdefault(key, value)
+            if config.get(key) is None:
+                config[key] = value
         if config.get('encoder') is not None:
             raise ValueError('PSS currently supports state or pre-encoded observations')
         if config.get('noise_chunk_length', -1) != -1:
             raise ValueError('PSS requires a full action-chunk decoder noise input')
         if config['critic_updates_per_actor'] not in (1, 2):
             raise ValueError('critic_updates_per_actor must be 1 or 2')
+        if (not isinstance(config['noise_critic_grad_steps'], int)
+                or config['noise_critic_grad_steps'] < 1):
+            raise ValueError('noise_critic_grad_steps must be a positive integer')
         action_dim = ex_actions.shape[-1]
         horizon = config['horizon_length'] if config['action_chunking'] else 1
         dim, k = action_dim * horizon, config['pss_dim']
@@ -193,13 +311,16 @@ class PSSAgent(DSRLBestOfNAgent):
                                    time_embedding=time_embedding, **two_tier)
         actor_def = ModuleDict(dict(actor=actor, temp=LogParam(config['init_temperature'])))
         critic_def = ModuleDict(dict(critic=critic, target_critic=copy.deepcopy(critic)))
+        noise_def = ModuleDict(dict(noise_critic=copy.deepcopy(critic)))
         decoder_def = ModuleDict(dict(actor_bc_flow=decoder))
-        rng, actor_key, critic_key, decoder_key = jax.random.split(jax.random.PRNGKey(seed), 4)
+        rng, actor_key, critic_key, decoder_key, noise_key = jax.random.split(jax.random.PRNGKey(seed), 5)
         actor_params = actor_def.init(actor_key, actor=(ex_observations,), temp=())['params']
         critic_params = critic_def.init(
-            critic_key, critic=(ex_observations, jnp.zeros(k)),
-            target_critic=(ex_observations, jnp.zeros(k)))['params']
+            critic_key, critic=(ex_observations, jnp.zeros(dim)),
+            target_critic=(ex_observations, jnp.zeros(dim)))['params']
         critic_params['modules_target_critic'] = critic_params['modules_critic']
+        noise_params = noise_def.init(
+            noise_key, noise_critic=(ex_observations, jnp.zeros(k)))['params']
         decoder_params = decoder_def.init(
             decoder_key, actor_bc_flow=(ex_observations, jnp.zeros(dim), jnp.zeros(1)))['params']
 
@@ -221,6 +342,8 @@ class PSSAgent(DSRLBestOfNAgent):
             critic_network=TrainState.create(critic_def, critic_params,
                 optimizer(config['lr_critic'], config['optimizer_critic'],
                           config.get('critic_weight_decay', 1e-4))),
+            noise_critic_network=TrainState.create(noise_def, noise_params,
+                optimizer(config['lr_noise_critic'], config['optimizer_critic'])),
             bc_flow_network=TrainState.create(decoder_def, decoder_params, optax.set_to_zero()),
             config=flax.core.FrozenDict(config), steering_basis=jnp.eye(dim),
             response_eigenvalues=jnp.zeros(dim), basis_ready=jnp.asarray(False),

@@ -125,12 +125,14 @@ class CheckpointAndUpdateTests(unittest.TestCase):
         agent = fitted_small_agent()
         batch = dict(observations=jnp.zeros((2, 3, 23)),
                      next_observations=jnp.ones((2, 3, 23)),
-                     actions=jnp.zeros((2, 3, 2)), rewards=-jnp.ones((2, 3)),
+                     actions=jnp.zeros((2, 3, 2)), true_actions=jnp.zeros((2, 3, 28)), rewards=-jnp.ones((2, 3)),
                      masks=jnp.ones((2, 3)), chunk_length=jnp.full((2, 3), 4))
         for success in (False, True):
             updated, info = agent.batch_update(batch, batch if success else None, success)
             self.assertEqual(int(updated.actor_network.step) - int(agent.actor_network.step), 2)
             self.assertEqual(int(updated.critic_network.step) - int(agent.critic_network.step), 4)
+            self.assertEqual(int(updated.noise_critic_network.step) - int(agent.noise_critic_network.step), 20)
+            self.assertIn('noise_critic/noise_critic_distill_loss', info)
             self.assertTrue(all(np.isfinite(x).all() for x in jax.tree.leaves(info)))
             for x, y in zip(jax.tree.leaves(agent.bc_flow_network), jax.tree.leaves(updated.bc_flow_network)):
                 np.testing.assert_array_equal(x, y)
@@ -138,6 +140,9 @@ class CheckpointAndUpdateTests(unittest.TestCase):
         restored = flax.serialization.from_state_dict(make_agent(), flax.serialization.to_state_dict(updated))
         np.testing.assert_array_equal(restored.steering_basis, updated.steering_basis)
         self.assertTrue(bool(restored.basis_ready))
+        for x, y in zip(jax.tree.leaves(restored.noise_critic_network),
+                        jax.tree.leaves(updated.noise_critic_network)):
+            np.testing.assert_array_equal(x, y)
         observations, key = jnp.zeros((3, 23)), jax.random.PRNGKey(17)
         np.testing.assert_array_equal(restored.sample_actions(observations, key),
                                       updated.sample_actions(observations, key))
@@ -145,14 +150,97 @@ class CheckpointAndUpdateTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'k-dimensional'):
             agent.batch_update(dict(batch, actions=jnp.zeros((2, 3, 28))))
 
+    def test_action_td_and_distillation_losses_and_gradient_routing(self):
+        agent = fitted_small_agent()
+        batch = dict(observations=jnp.ones((3, 23)),
+                     next_observations=jnp.full((3, 23), .5),
+                     actions=jnp.zeros((3, 2)), true_actions=jnp.full((3, 28), .25),
+                     rewards=jnp.array([-1., -2., -3.]), masks=jnp.array([1., 0., 1.]),
+                     chunk_length=jnp.array([4, 1, 2]))
+        rng = jax.random.PRNGKey(51)
+        for entropy_backup in (False, True):
+            for aggregation in ('min', 'mean'):
+                current = agent.replace(config=agent.config.copy(dict(
+                    entropy_backup=entropy_backup, q_agg=aggregation)))
+                sample_rng, complement_rng = jax.random.split(rng)
+                next_dist = current.actor_network.select('actor')(batch['next_observations'])
+                z, log_prob = next_dist.sample_and_log_prob(seed=sample_rng)
+                actions = current.compute_flow_actions(batch['next_observations'],
+                    noises=current.reconstruct_noise(z, complement_rng))
+                next_qs = current.critic_network.select('target_critic')(
+                    batch['next_observations'], actions=actions)
+                next_q = (jnp.min if aggregation == 'min' else jnp.mean)(next_qs, axis=0)
+                if entropy_backup:
+                    next_q -= current.actor_network.select('temp')() * jnp.clip(log_prob, -100, 100)
+                target = jnp.clip(batch['rewards'] + batch['masks']
+                    * current.config['discount'] ** batch['chunk_length'] * next_q, -500, 500)
+                pred = current.critic_network.select('critic')(
+                    batch['observations'], actions=batch['true_actions'])
+                loss, _ = current.critic_loss(batch, current.critic_network.params, rng)
+                np.testing.assert_allclose(loss, jnp.mean((pred - target) ** 2), rtol=1e-6)
+
+        # Distillation uses random steering coordinates and the decoded action
+        # teacher, independent of replay rewards/actions and with no teacher gradient.
+        noise_rng, complement_rng = jax.random.split(rng)
+        z = agent.config['action_magnitude'] * jnp.tanh(jax.random.normal(noise_rng, (3, 2)))
+        actions = agent.compute_flow_actions(batch['observations'],
+            noises=agent.reconstruct_noise(z, complement_rng))
+        teacher = agent.critic_network.select('critic')(batch['observations'], actions=actions)
+        pred = agent.noise_critic_network.select('noise_critic')(batch['observations'], actions=z)
+        loss, _ = agent.noise_critic_distill_loss(batch, agent.noise_critic_network.params, rng)
+        np.testing.assert_allclose(loss, jnp.mean((pred - teacher) ** 2), rtol=1e-6)
+        changed = dict(batch, rewards=batch['rewards'] * 10, actions=batch['actions'] + 1,
+                       true_actions=-batch['true_actions'])
+        other_loss, _ = agent.noise_critic_distill_loss(changed, agent.noise_critic_network.params, rng)
+        np.testing.assert_array_equal(loss, other_loss)
+        teacher_grad = jax.grad(lambda p: agent.replace(
+            critic_network=agent.critic_network.replace(params=p)).noise_critic_distill_loss(
+                batch, agent.noise_critic_network.params, rng)[0])(agent.critic_network.params)
+        self.assertTrue(all(np.all(np.asarray(x) == 0) for x in jax.tree.leaves(teacher_grad)))
+
+        # SAC evaluates Q(s,z), so changing only Q(s,a) cannot change actor loss.
+        actor_loss, _ = agent.actor_loss(batch, agent.actor_network.params, rng)
+        altered = agent.replace(critic_network=agent.critic_network.replace(
+            params=jax.tree.map(lambda x: x + 10, agent.critic_network.params)))
+        altered_loss, _ = altered.actor_loss(batch, agent.actor_network.params, rng)
+        np.testing.assert_array_equal(actor_loss, altered_loss)
+
+    def test_configurable_critic_and_distillation_update_frequencies(self):
+        agent = fitted_small_agent()
+        batch = dict(observations=jnp.zeros((1, 2, 23)),
+                     next_observations=jnp.ones((1, 2, 23)),
+                     actions=jnp.zeros((1, 2, 2)), true_actions=jnp.zeros((1, 2, 28)),
+                     rewards=-jnp.ones((1, 2)), masks=jnp.ones((1, 2)),
+                     chunk_length=jnp.full((1, 2), 4))
+        for extra, success in ((False, False), (True, False), (True, True)):
+            current = agent.replace(config=agent.config.copy(dict(
+                critic_updates_per_actor=1, use_success_buffer_q=extra, noise_critic_grad_steps=3)))
+            updated, _ = current.batch_update(batch, batch, success)
+            self.assertEqual(int(updated.actor_network.step) - int(current.actor_network.step), 1)
+            self.assertEqual(int(updated.critic_network.step) - int(current.critic_network.step),
+                             1 + int(extra and success))
+            self.assertEqual(int(updated.noise_critic_network.step) - int(current.noise_critic_network.step), 3)
+        missing = {k: v for k, v in batch.items() if k != 'true_actions'}
+        with self.assertRaisesRegex(ValueError, 'true_actions'):
+            agent.batch_update(missing)
+        for value in (0, -1, 1.5):
+            config = dict(agent.config, noise_critic_grad_steps=value)
+            with self.assertRaisesRegex(ValueError, 'positive integer'):
+                PSSAgent.create(1, jnp.zeros(23), jnp.zeros(7), config)
+
     def test_matched_configuration_and_logging(self):
         pss, dsrl = load_config('pss_ogpo_square_shared'), load_config('dsrl_ogpo_square_shared')
         for section in ('env', 'training', 'buffer', 'eval', 'intervals', 'bc',
                         'success_buffer', 'dataset', 'checkpoint'):
             self.assertEqual(pss[section], dsrl[section], section)
         for key, value in dsrl['agent'].items():
-            if key != 'agent_name':
+            if key not in ('agent_name', 'lr_noise_critic', 'noise_critic_grad_steps'):
                 self.assertEqual(pss['agent'][key], value, key)
+        reference = load_config('dsrl_plus_expo')['agent']
+        for name in ('pss', 'pss_ogpo_square_shared'):
+            config = load_config(name)['agent']
+            for key in ('lr_noise_critic', 'noise_critic_grad_steps'):
+                self.assertEqual(config[key], reference[key])
         self.assertIn('online_budget', training_log_prefixes('pss', 2_000_000))
 
 
@@ -199,8 +287,10 @@ class RunnerTests(unittest.TestCase):
         budget = [record for prefix, record, _ in logger.records if prefix == 'online_budget'][-1]
         self.assertEqual(budget['gradient_updates'], 28)
         self.assertEqual(budget['critic_gradient_updates'], 56)
+        self.assertEqual(budget['noise_critic_gradient_updates'], 280)
         self.assertEqual(int(updated.actor_network.step) - int(agent.actor_network.step), 28)
         self.assertEqual(int(updated.critic_network.step) - int(agent.critic_network.step), 56)
+        self.assertEqual(int(updated.noise_critic_network.step) - int(agent.noise_critic_network.step), 280)
         np.testing.assert_allclose(replay['actions'][:replay.size],
             replay['initial_noise'][:replay.size] @ np.asarray(updated.steering_basis[:, :2]), atol=1e-6)
         self.assertIn(1, replay['chunk_length'][:replay.size])
