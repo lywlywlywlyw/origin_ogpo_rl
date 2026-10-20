@@ -227,6 +227,9 @@ def run_grace_online_rl(
                     noise = jax.random.normal(key, (noise_dim,))
                 current_noise = np.array(noise).flatten()
                 action = agent.noise_to_actions_public(ob, noise)
+                if config.get('decoder_add_noise', False):
+                    online_rng, noise_rng = jax.random.split(online_rng)
+                    action = agent.add_decoder_noise(action, noise_rng)
 
                 current_true_actions = np.array(action).flatten()
                 action_chunk = np.array(action).reshape(-1, action_dim)

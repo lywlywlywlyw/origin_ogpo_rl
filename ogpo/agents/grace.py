@@ -1,4 +1,5 @@
 import copy
+import math
 from typing import Any, Tuple
 
 import flax
@@ -336,6 +337,18 @@ class GRACEAgent(flax.struct.PyTreeNode):
         return actions
 
     @jax.jit
+    def add_decoder_noise(self, actions, noise_rng):
+        """Bounded LPS-style exploration noise for online collection only."""
+        if not self.config.get('decoder_add_noise', False):
+            return actions
+        center = jnp.clip(actions, -1.0, 1.0)
+        std = self.config.get('decoder_noise_std', 0.09)
+        sample = center + std * jax.random.normal(noise_rng, center.shape)
+        radius = self.config.get('decoder_noise_clip', 3.0) * std
+        sample = jnp.clip(sample, center - radius, center + radius)
+        return jnp.clip(sample, -1.0, 1.0)
+
+    @jax.jit
     def noise_to_actions_public(self, observations, actor_noise):
         if self.config["noise_chunk_length"] > 0:
             assert self.config["noise_chunk_length"] == 1
@@ -456,6 +469,16 @@ class GRACEAgent(flax.struct.PyTreeNode):
 
     @classmethod
     def create(cls, seed, ex_observations, ex_actions, config):
+        config = dict(config)
+        config.setdefault('decoder_add_noise', False)
+        config.setdefault('decoder_noise_std', 0.09)
+        config.setdefault('decoder_noise_clip', 3.0)
+        for name in ('decoder_noise_std', 'decoder_noise_clip'):
+            config[name] = float(config[name])
+            if not math.isfinite(config[name]) or config[name] < 0:
+                raise ValueError(f'{name} must be finite and nonnegative')
+        if config['decoder_noise_clip'] == 0:
+            raise ValueError('decoder_noise_clip must be positive')
         if config.get('critic_updates_per_actor', 1) not in (1, 2):
             raise ValueError('critic_updates_per_actor must be 1 or 2')
         rng = jax.random.PRNGKey(seed)

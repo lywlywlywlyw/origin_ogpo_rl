@@ -54,6 +54,80 @@ class GraceTests(unittest.TestCase):
         from ogpo.utils.main_helper import training_log_prefixes
         self.assertIn('online_budget', training_log_prefixes('grace', 100))
 
+    def test_bounded_decoder_noise_and_unchanged_evaluation(self):
+        _, grace = make_pair()
+        self.assertFalse(grace.config['decoder_add_noise'])
+        self.assertEqual(grace.config['decoder_noise_std'], .09)
+        self.assertEqual(grace.config['decoder_noise_clip'], 3.)
+        actions = jnp.tile(jnp.array([-2., -.95, 0., .95, 2.]), 200)
+        key = jax.random.PRNGKey(17)
+        np.testing.assert_array_equal(grace.add_decoder_noise(actions, key), actions)
+        noisy = grace.replace(config=grace.config.copy(dict(
+            decoder_add_noise=True, decoder_noise_clip=.5)))
+        center = jnp.clip(actions, -1., 1.)
+        raw = center + .09 * jax.random.normal(key, center.shape)
+        expected = jnp.clip(jnp.clip(raw, center - .045, center + .045), -1., 1.)
+        actual = noisy.add_decoder_noise(actions, key)
+        np.testing.assert_allclose(actual, expected, atol=1e-7)
+        self.assertTrue(np.all(np.abs(actual) <= 1.))
+        self.assertGreater(float(jnp.max(jnp.abs(actual - center))), .044)
+        np.testing.assert_array_equal(actual, noisy.add_decoder_noise(actions, key))
+        self.assertFalse(np.array_equal(actual, noisy.add_decoder_noise(actions, jax.random.fold_in(key, 1))))
+        obs = jnp.zeros(3)
+        np.testing.assert_array_equal(grace.sample_actions(obs, key), noisy.sample_actions(obs, key))
+        zero = noisy.replace(config=noisy.config.copy(dict(decoder_noise_std=0.)))
+        np.testing.assert_array_equal(zero.add_decoder_noise(actions, key), center)
+        for name, value in (('decoder_noise_std', -.1), ('decoder_noise_std', float('nan')),
+                            ('decoder_noise_clip', 0.)):
+            with self.assertRaisesRegex(ValueError, name):
+                GRACEAgent.create(1, obs, jnp.zeros(2), dict(grace.config, **{name: value}))
+
+    def test_online_decoder_noise_is_executed_and_stored(self):
+        _, grace = make_pair()
+        grace = grace.replace(config=grace.config.copy(dict(decoder_add_noise=True)))
+        class Env:
+            def __init__(self):
+                self.executed = []
+            def reset(self, seed):
+                self.steps = 0
+                return np.zeros(3), {}
+            def step(self, action):
+                self.executed.append(np.asarray(action))
+                self.steps += 1
+                return np.zeros(3), -1., self.steps == 5, False, {'success': 0.}
+        class Dataset:
+            def sample(self, shape):
+                return dict(observations=np.zeros(3), actions=np.zeros(2))
+        class Logger:
+            def log(self, *args, **kwargs):
+                pass
+        env = Env()
+        with patch('ogpo.runners.grace_runner.save_agent'), patch(
+                'ogpo.runners.grace_runner._run_evaluation', return_value={'success': 0.}):
+            _, _, _, replay = run_grace_online_rl(
+                grace, env, env, None, Dataset(), dict(grace.config), Logger(), '/unused',
+                algo_name='grace', discount=.99, seed=1,
+                online_steps=10, start_training=20, batch_size=1, horizon_length=4,
+                n_eval_envs=1, eval_interval=-1, log_interval=-1, save_interval=-1,
+                force_jax_sync=False, buffer_size=100)
+        self.assertEqual(len(env.executed), 10)
+        online_rng = jax.random.PRNGKey(40001)
+        position = 0
+        for index in range(replay.size):
+            online_rng, latent_rng = jax.random.split(online_rng)
+            z = jax.random.normal(latent_rng, (8,))
+            clean = grace.noise_to_actions_public(jnp.zeros(3), z)
+            online_rng, noise_rng = jax.random.split(online_rng)
+            expected = grace.add_decoder_noise(clean, noise_rng)
+            np.testing.assert_allclose(replay['true_actions'][index], expected, atol=1e-7)
+            np.testing.assert_array_equal(replay['actions'][index], z)
+            self.assertFalse(np.array_equal(clean, expected))
+            length = int(replay['chunk_length'][index])
+            np.testing.assert_allclose(env.executed[position:position + length],
+                                       np.asarray(expected).reshape(4, 2)[:length], atol=1e-7)
+            position += length
+        self.assertEqual(position, 10)
+
     def test_distillation_updates_and_frozen_decoder(self):
         dsrl, grace = make_pair()
         self.assertEqual(grace.config['gradient_delta_a'], 1.)
