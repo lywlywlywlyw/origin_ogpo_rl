@@ -5,10 +5,12 @@ experiment:
   wandb_name: grace_square_shared_ogpo_bc
 agent:
   agent_name: grace
+  # True: unsquashed encoder with zero mean/log-std heads, initially N(0, I).
+  encoder_normal_init: true
   gradient_delta_a: null
   gradient_delta_z: null
   gradient_ratio_epsilon: 1.0e-8
   # Bounded Gaussian noise after decoding, for online collection only.
-  decoder_add_noise: True
+  decoder_add_noise: false
   decoder_noise_std: 0.09
   decoder_noise_clip: 3.0  # Match LPS's bounded-noise branch.

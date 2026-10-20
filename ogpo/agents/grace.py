@@ -470,6 +470,7 @@ class GRACEAgent(flax.struct.PyTreeNode):
     @classmethod
     def create(cls, seed, ex_observations, ex_actions, config):
         config = dict(config)
+        config.setdefault('encoder_normal_init', False)
         config.setdefault('decoder_add_noise', False)
         config.setdefault('decoder_noise_std', 0.09)
         config.setdefault('decoder_noise_clip', 3.0)
@@ -535,7 +536,7 @@ class GRACEAgent(flax.struct.PyTreeNode):
             action_dim=noise_dim,
             layer_norm=config['actor_layer_norm'],
             encoder=encoders.get('actor'),
-            tanh_squash=True,
+            tanh_squash=not config['encoder_normal_init'],
             state_dependent_std=True,
             low=-config["action_magnitude"],
             high=config["action_magnitude"],
@@ -614,6 +615,12 @@ class GRACEAgent(flax.struct.PyTreeNode):
 
         rng, actor_rng, critic_rng, bc_flow_rng = jax.random.split(rng, 4)
         actor_params = actor_net_def.init(actor_rng, **actor_args)['params']
+        if config['encoder_normal_init']:
+            # An unsquashed, state-independent N(0, I) before the first update.
+            # Initialize before creating Adam state; both heads remain trainable.
+            for head in ('mean_net', 'log_std_net'):
+                actor_params['modules_actor'][head] = jax.tree.map(
+                    jnp.zeros_like, actor_params['modules_actor'][head])
         critic_params = critic_net_def.init(critic_rng, **critic_args)['params']
         bc_flow_params = bc_flow_net_def.init(bc_flow_rng, **bc_flow_args)['params']
 

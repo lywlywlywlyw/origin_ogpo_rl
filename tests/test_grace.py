@@ -42,6 +42,43 @@ def assert_tree_equal(test, a, b):
 
 
 class GraceTests(unittest.TestCase):
+    def test_encoder_normal_init_is_standard_normal_and_trainable(self):
+        _, baseline = make_pair()
+        config = dict(baseline.config, encoder_normal_init=True, action_magnitude=.5)
+        grace = GRACEAgent.create(1, jnp.zeros(3), jnp.zeros(2), config)
+        observations = jax.random.normal(jax.random.PRNGKey(31), (128, 3)) * 10
+        dist = grace.actor_network.select('actor')(observations)
+        np.testing.assert_array_equal(dist.mean(), np.zeros((128, 8)))
+        np.testing.assert_array_equal(dist.stddev(), np.ones((128, 8)))
+        for head in ('mean_net', 'log_std_net'):
+            for leaf in jax.tree.leaves(grace.actor_network.params['modules_actor'][head]):
+                np.testing.assert_array_equal(leaf, np.zeros_like(leaf))
+        key = jax.random.PRNGKey(32)
+        samples = grace.sample_noise(observations, key)
+        self.assertTrue(np.any(np.abs(samples) > 1.))
+        np.testing.assert_array_equal(samples, dist.sample(seed=key))
+        expected_log_probs = -.5 * jnp.sum(samples ** 2 + jnp.log(2 * jnp.pi), axis=-1)
+        np.testing.assert_allclose(dist.log_prob(samples), expected_log_probs, rtol=1e-6)
+        np.testing.assert_array_equal(dist.mode(), np.zeros((128, 8)))
+        updated, metrics = grace.batch_update(batch())
+        self.assertTrue(np.isfinite(metrics['actor/total_loss']))
+        self.assertTrue(any(np.any(np.asarray(leaf) != 0) for leaf in jax.tree.leaves(
+            updated.actor_network.params['modules_actor']['mean_net'])))
+
+    def test_encoder_normal_init_disabled_preserves_original_policy(self):
+        dsrl, grace = make_pair()
+        self.assertFalse(grace.config['encoder_normal_init'])
+        observations = jax.random.normal(jax.random.PRNGKey(33), (128, 3))
+        key = jax.random.PRNGKey(34)
+        np.testing.assert_array_equal(grace.sample_noise(observations, key),
+                                      dsrl.sample_noise(observations, key))
+        self.assertTrue(np.all(np.abs(grace.sample_noise(observations, key)) <= 1.))
+        config = dict(grace.config)
+        config.pop('encoder_normal_init')
+        default = GRACEAgent.create(1, jnp.zeros(3), jnp.zeros(2), config)
+        np.testing.assert_array_equal(default.sample_noise(observations, key),
+                                      grace.sample_noise(observations, key))
+
     def test_config_matches_dsrl(self):
         dsrl = load_config('dsrl_ogpo_square_shared')
         grace = load_config('grace_ogpo_square_shared')
