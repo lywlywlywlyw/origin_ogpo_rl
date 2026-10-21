@@ -64,8 +64,9 @@ inverted with reverse Euler integration. Forward decoding branches with independ
 `N(0,I)` noise after each of the final `noise_add_start` Euler steps, producing
 `increase_num ** noise_add_start` extra chunks per original. Only final actions
 are clipped to `[-1, 1]`; recovered latents are not clipped or projected. Original
-step rewards stay unchanged (Robomimic offline: failure `-1`, success `0`; online
-success receives an additional `+5`). Synthetic step rewards are `-1`, aggregated
+offline step rewards are aligned with online rewards before chunk aggregation:
+failure `-1`, success `+5` (converting the loader's success reward from `0` to `+5`).
+Already-shaped success rewards remain `+5`. Synthetic step rewards are `-1`, aggregated
 using the same chunk reward rule as online training. Synthetic transitions are
 terminal (`terminals=1`, `masks=0`), so their TD targets contain only rewards and
 do not bootstrap. Original transition masks and terminals stay unchanged. Chunks

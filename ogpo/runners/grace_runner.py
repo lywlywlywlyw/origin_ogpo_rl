@@ -75,7 +75,9 @@ def _offline_q_chunks(dataset, starts, horizon_length, discount, aggregation):
     valid = np.arange(horizon_length)[None, :] < lengths[:, None]
     first = dataset.sample(len(starts), idxs=starts)
     last = dataset.sample(len(starts), idxs=starts + lengths - 1)
-    rewards = dataset['rewards'][indices]
+    # Robomimic loading yields -1/0; match online -1/+5 before aggregation.
+    # Assign the success reward explicitly so already-shaped +5 stays +5.
+    rewards = np.where(dataset['rewards'][indices] > -0.5, 5., -1.)
     if aggregation == 'discounted_sum':
         weights = discount ** np.arange(horizon_length)
         original_rewards = (rewards * valid * weights).sum(axis=1)
@@ -131,7 +133,8 @@ def _build_q_pretrain_dataset(agent, dataset, config, batch_size, seed):
     if output is None:
         raise ValueError('pretrain_qnet requires a nonempty offline dataset')
     print(f'Q pretraining: {dataset.size} original + {dataset.size * factor} augmented chunks; '
-          f'offline step rewards={np.unique(dataset["rewards"])}; augmented step reward=-1')
+          f'offline step rewards={np.unique(np.where(dataset["rewards"] > -0.5, 5., -1.))}; '
+          f'augmented step reward=-1')
     return Dataset.create(**output, numpy_rng=np.random.default_rng(seed + 60000))
 
 

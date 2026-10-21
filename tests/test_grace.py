@@ -87,8 +87,20 @@ class GraceTests(unittest.TestCase):
         chunks, failures = _offline_q_chunks(dataset, np.array([0, 2, 3, 5]), 4, .99,
                                               'discounted_sum')
         np.testing.assert_array_equal(chunks['chunk_length'], [3, 1, 3, 1])
-        np.testing.assert_allclose(chunks['rewards'], [-1.99, 0, -1.99, 0])
+        np.testing.assert_allclose(chunks['rewards'], [-1.99 + .99**2 * 5, 5,
+                                                     -1.99 + .99**2 * 5, 5])
         np.testing.assert_allclose(failures, [-2.9701, -1, -2.9701, -1])
+        max_chunks, max_failures = _offline_q_chunks(
+            dataset, np.array([0, 2, 3, 5]), 4, .99, 'max')
+        np.testing.assert_array_equal(max_chunks['rewards'], 5.)
+        np.testing.assert_array_equal(max_failures, -1.)
+        shaped_dataset = Dataset.create(**dict(dataset, rewards=np.where(
+            dataset['rewards'] == 0., 5., dataset['rewards']).astype(np.float32)))
+        shaped_chunks, _ = _offline_q_chunks(
+            shaped_dataset, np.array([0, 2, 3, 5]), 4, .99, 'discounted_sum')
+        np.testing.assert_array_equal(shaped_chunks['rewards'], chunks['rewards'])
+        failure_chunk, _ = _offline_q_chunks(dataset, np.array([0]), 1, .99, 'max')
+        np.testing.assert_array_equal(failure_chunk['rewards'], -1.)
         np.testing.assert_array_equal(chunks['next_observations'], dataset['next_observations'][[2,2,5,5]])
         np.testing.assert_array_equal(chunks['true_actions'][1].reshape(4, 2),
                                       np.tile(dataset['actions'][2], (4, 1)))
@@ -97,6 +109,7 @@ class GraceTests(unittest.TestCase):
         all_chunks, _ = _offline_q_chunks(dataset, np.arange(6), 4, .99, 'discounted_sum')
         np.testing.assert_array_equal(expanded['true_actions'][::5], all_chunks['true_actions'])
         np.testing.assert_allclose(expanded['rewards'][::5], all_chunks['rewards'])
+        self.assertEqual(expanded['rewards'][10], 5.)  # original success-step sample
         self.assertEqual(expanded['rewards'][11], -1.)  # augmented success-step sample
         np.testing.assert_array_equal(expanded['masks'][::5], all_chunks['masks'])
         np.testing.assert_array_equal(expanded['terminals'][::5], all_chunks['terminals'])
