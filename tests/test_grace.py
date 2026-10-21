@@ -21,7 +21,7 @@ from ogpo.utils.config_loader import load_config, config_to_agent_dict
 def make_pair():
     config = config_to_agent_dict(load_config('grace_ogpo_square_shared'))
     config.update(actor_hidden_dims=(8, 8), value_hidden_dims=(8, 8), num_qs=2,
-                  encoder_sphere_limit=True, use_layer_norm=False)
+                  encoder_sphere_limit=True, use_layer_norm=False, use_encoder_clip=False)
     dsrl = DSRLBestOfNAgent.create(1, jnp.zeros(3), jnp.zeros(2), dict(config))
     grace = GRACEAgent.create(1, jnp.zeros(3), jnp.zeros(2), dict(config))
     return dsrl, grace
@@ -43,6 +43,79 @@ def assert_tree_equal(test, a, b):
 
 
 class GraceTests(unittest.TestCase):
+    def test_encoder_clip_sampling_losses_and_prior(self):
+        config = config_to_agent_dict(load_config('grace_ogpo_square_shared'))
+        config.update(actor_hidden_dims=(8, 8), value_hidden_dims=(8, 8), num_qs=2,
+                      use_layer_norm=False, use_encoder_clip=True,
+                      encoder_sphere_limit=False, action_magnitude=2.)
+        agent = GRACEAgent.create(1, jnp.zeros(3), jnp.zeros(2), config)
+        obs = jax.random.normal(jax.random.PRNGKey(7), (128, 3))
+        key = jax.random.PRNGKey(9)
+        dist = agent.actor_network.select('actor')(obs)
+        raw = dist.sample(seed=key)
+        clipped = jnp.clip(raw, -1., 1.)
+        self.assertTrue(bool(jnp.any(jnp.abs(raw) > 1.)))
+        np.testing.assert_allclose(agent.sample_noise(obs, key), clipped, atol=1e-6)
+        np.testing.assert_allclose(agent.sample_noise(obs, key, deterministic=True),
+                                   jnp.clip(dist.mode(), -1., 1.), atol=1e-6)
+        np.testing.assert_allclose(agent.sample_actions(obs, key),
+            agent.noise_to_actions_public(obs, clipped, noises_constrained=True), atol=1e-6)
+
+        data = jax.tree.map(lambda x: x[0], batch())
+        actor_dist = agent.actor_network.select('actor')(data['observations'])
+        _, sample_key = jax.random.split(key)
+        raw_samples, raw_log_probs = actor_dist.sample_and_log_prob(seed=sample_key)
+        q = agent._aggregate_q(agent.critic_network.select('critic')(
+            data['observations'], actions=jnp.clip(raw_samples, -1., 1.)))
+        _, info = agent.actor_loss(data, agent.actor_network.params, key)
+        expected_loss = jnp.mean(agent.actor_network.select('temp')() * raw_log_probs - q)
+        np.testing.assert_allclose(info['actor_loss'], expected_loss, atol=1e-6)
+        _, bc_info = agent.actor_bc_loss(data, agent.actor_network.params, key)
+        np.testing.assert_allclose(bc_info['actor_bc_loss_unweighted'], jnp.mean(
+            (jnp.clip(actor_dist.mode(), -1., 1.) - data['actions']) ** 2), atol=1e-6)
+
+        next_dist = agent.actor_network.select('actor')(data['next_observations'])
+        next_z, next_log_probs = next_dist.sample_and_log_prob(seed=sample_key)
+        next_a = agent.noise_to_actions_public(
+            data['next_observations'], jnp.clip(next_z, -1., 1.), noises_constrained=True)
+        next_q = agent._aggregate_q(agent.action_critic_network.select('target_critic')(
+            data['next_observations'], actions=next_a))
+        target = jnp.clip(data['rewards'] + config['discount'] ** data['chunk_length'] *
+                          data['masks'] * next_q, -500., 500.)
+        predicted = agent.action_critic_network.select('critic')(
+            data['observations'], actions=data['true_actions'])
+        loss, _ = agent.action_critic_loss(data, agent.action_critic_network.params, key)
+        np.testing.assert_allclose(loss, jnp.mean((predicted-target) ** 2), atol=1e-6)
+
+        # The clip switch belongs to the encoder, not Gaussian warmup/distillation.
+        prior = jax.random.normal(key, data['actions'].shape)
+        _, prior_info = agent.critic_loss(data, agent.critic_network.params, key)
+        np.testing.assert_allclose(prior_info['noise_std'], prior.std(), atol=1e-6)
+        np.testing.assert_allclose(agent.constrain_encoder_output(raw), raw, atol=1e-6)
+        for loss_fn, params in ((agent.actor_loss, agent.actor_network.params),
+                                (agent.actor_bc_loss, agent.actor_network.params)):
+            gradients = jax.grad(lambda p: loss_fn(data, p, key)[0])(params)
+            self.assertTrue(all(np.isfinite(x).all() for x in jax.tree.leaves(gradients)))
+
+    def test_encoder_clip_disabled_and_sphere_conflict(self):
+        config = config_to_agent_dict(load_config('grace_ogpo_square_shared'))
+        config.update(actor_hidden_dims=(8, 8), value_hidden_dims=(8, 8), num_qs=2,
+                      use_layer_norm=False, encoder_sphere_limit=False, use_encoder_clip=False)
+        agent = GRACEAgent.create(1, jnp.zeros(3), jnp.zeros(2), config)
+        legacy = dict(config)
+        legacy.pop('use_encoder_clip')
+        legacy = GRACEAgent.create(1, jnp.zeros(3), jnp.zeros(2), legacy)
+        obs = jnp.ones((4, 3))
+        key = jax.random.PRNGKey(21)
+        np.testing.assert_array_equal(agent.sample_noise(obs, key), legacy.sample_noise(obs, key))
+        config['use_encoder_clip'] = True
+        clip_agent = GRACEAgent.create(1, jnp.zeros(3), jnp.zeros(2), config)
+        assert_tree_equal(self, agent.actor_network.params, clip_agent.actor_network.params)
+        assert_tree_equal(self, agent.bc_flow_network.params, clip_agent.bc_flow_network.params)
+        config['encoder_sphere_limit'] = True
+        with self.assertRaisesRegex(ValueError, 'mutually exclusive'):
+            GRACEAgent.create(1, jnp.zeros(3), jnp.zeros(2), config)
+
     def test_encoder_sphere_matches_lps_and_sampling_paths(self):
         _, grace = make_pair()
         self.assertTrue(grace.config['encoder_sphere_limit'])

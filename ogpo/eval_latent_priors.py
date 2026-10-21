@@ -97,7 +97,8 @@ def main():
     key = jax.random.PRNGKey(args.eval_seed)
     epsilon = jax.random.normal(key, (2, agent.config['noise_dim']))
     expected = {'A': epsilon, 'B': jnp.tanh(epsilon),
-                'C': agent.actor_network.select('actor')(observations).sample(seed=key)}
+                'C': agent.constrain_actor_output(
+                    agent.actor_network.select('actor')(observations).sample(seed=key))}
     for policy, sample in samplers.items():
         latent = sample(observations, key)
         np.testing.assert_allclose(latent, expected[policy], rtol=1e-5, atol=1e-6)
@@ -131,6 +132,7 @@ def main():
           f'Dataset: {dataset_path}\n'
           f'Actor seed: {args.seed}; evaluation seed: {args.eval_seed}\n'
           f'Actor LayerNorm: {agent_config["actor_layer_norm"] or args.use_layer_norm}\n'
+          f'Encoder clip: {agent.config["use_encoder_clip"]}\n'
           f'Latent dimension: {agent.config["noise_dim"]}\n'
           f'Each policy: {n_envs} environments x {episodes} = {n_envs * episodes} episodes.',
           flush=True)

@@ -11,6 +11,9 @@ agent:
   use_layer_norm: false
   # True: skip encoder tanh; use the LPS sphere for ALL decoder initial latents.
   encoder_sphere_limit: false
+  # Replace encoder tanh with hard clip(raw Gaussian, -1, 1).
+  # Mutually exclusive with encoder_sphere_limit; entropy uses the raw Gaussian.
+  use_encoder_clip: true
   # Independently disable SAC actor entropy and temperature (alpha) loss.
   delete_sac_entropy: false
   gradient_delta_a: null
