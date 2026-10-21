@@ -333,6 +333,8 @@ def training_log_prefixes(algo_name, online_steps, bc_only=False,
         prefixes.append('online_agent')
         if algo_name in ('dsrl', 'dsrl_bon', 'dsrl_plus_expo', 'pss', 'gorl', 'grace'):
             prefixes.append('online_budget')
+    if algo_name == 'grace' and online_steps > 0 and not bc_only:
+        prefixes.append('q_pretrain')
     if algo_name == 'gorl' and online_steps > 0 and not bc_only:
         prefixes.append('gorl_decoder')
     if algo_name in ('ogpo', 'reinflow_calql'):

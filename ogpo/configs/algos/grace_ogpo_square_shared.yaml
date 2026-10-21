@@ -5,6 +5,13 @@ experiment:
   wandb_name: grace_square_shared_ogpo_bc
 agent:
   agent_name: grace
+  # Offline action-Q TD pretraining before online collection (decoder stays frozen).
+  pretrain_qnet: true
+  increase_num: 2
+  # Branch increase_num times after each of the final noise_add_start ODE steps.
+  noise_add_start: 2
+  # Full shuffled passes over original + augmented transitions.
+  pretrain_qnet_epochs: 1
   # SERL-style Dense -> LayerNorm -> activation in the online actor and critics.
   # Uses 10 Qs: min of 2 random Qs for TD backup; mean of all 10 for the actor
   # and latent-Q distillation. Frozen offline decoder architecture is unchanged.
@@ -13,7 +20,7 @@ agent:
   encoder_sphere_limit: false
   # Replace encoder tanh with hard clip(raw Gaussian, -1, 1).
   # Mutually exclusive with encoder_sphere_limit; entropy uses the raw Gaussian.
-  use_encoder_clip: true
+  use_encoder_clip: false
   # Independently disable SAC actor entropy and temperature (alpha) loss.
   delete_sac_entropy: false
   gradient_delta_a: null

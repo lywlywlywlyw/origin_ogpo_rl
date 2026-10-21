@@ -50,6 +50,32 @@ bash scripts/expo/square.sh
 bash scripts/fql/square.sh
 ```
 
+GRACE can pretrain its action critic with the frozen decoder before collecting
+online transitions:
+
+```bash
+uv run python -m ogpo.main --algo=grace_ogpo_square_shared \
+    --agent.pretrain_qnet=true --agent.increase_num=2 --agent.noise_add_start=2 \
+    --agent.pretrain_qnet_epochs=1
+```
+
+`pretrain_qnet` defaults to `false`. When enabled, every offline action chunk is
+inverted with reverse Euler integration. Forward decoding branches with independent
+`N(0,I)` noise after each of the final `noise_add_start` Euler steps, producing
+`increase_num ** noise_add_start` extra chunks per original. Only final actions
+are clipped to `[-1, 1]`; recovered latents are not clipped or projected. Original
+step rewards stay unchanged (Robomimic offline: failure `-1`, success `0`; online
+success receives an additional `+5`). Synthetic step rewards are `-1`, aggregated
+using the same chunk reward rule as online training. Synthetic transitions are
+terminal (`terminals=1`, `masks=0`), so their TD targets contain only rewards and
+do not bootstrap. Original transition masks and terminals stay unchanged. Chunks
+stop at episode boundaries; short action chunks repeat their final action for
+decoder input. One shuffled epoch over all
+original and synthetic chunks is the default; `pretrain_qnet_epochs` controls the
+number of passes. Pretraining updates only action Q and its target using the online
+TD loss, then keeps those parameters and optimizer state for online training.
+Metrics are recorded under `q_pretrain`.
+
 Runs log to Weights & Biases. Set `WANDB_API_KEY` in your environment to log
 online; without it, W&B falls back to offline mode. Experiment data (per-run
 `flags.json` and CSV logs) is written under `exp/` and checkpoints under

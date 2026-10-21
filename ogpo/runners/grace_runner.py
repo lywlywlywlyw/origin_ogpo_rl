@@ -65,6 +65,101 @@ def _sample_success_chunks(replay_buffer, batch_size):
     return replay_buffer.sample(batch_size, idxs=indices)
 
 
+def _offline_q_chunks(dataset, starts, horizon_length, discount, aggregation):
+    """Build online-compatible chunks, stopping/padding at episode boundaries."""
+    ends = np.searchsorted(dataset.terminal_locs, starts)
+    boundaries = np.append(dataset.terminal_locs, dataset.size - 1)[ends]
+    lengths = np.minimum(horizon_length, boundaries - starts + 1)
+    indices = np.minimum(starts[:, None] + np.arange(horizon_length),
+                         (starts + lengths - 1)[:, None])
+    valid = np.arange(horizon_length)[None, :] < lengths[:, None]
+    first = dataset.sample(len(starts), idxs=starts)
+    last = dataset.sample(len(starts), idxs=starts + lengths - 1)
+    rewards = dataset['rewards'][indices]
+    if aggregation == 'discounted_sum':
+        weights = discount ** np.arange(horizon_length)
+        original_rewards = (rewards * valid * weights).sum(axis=1)
+        augmented_rewards = -(valid * weights).sum(axis=1)
+    else:
+        original_rewards = np.where(valid, rewards, -np.inf).max(axis=1)
+        augmented_rewards = -np.ones(len(starts))
+    return dict(
+        observations=first['observations'],
+        true_actions=dataset['actions'][indices].reshape(len(starts), -1),
+        next_observations=last['next_observations'],
+        rewards=original_rewards.astype(np.float32),
+        masks=last['masks'], terminals=last['terminals'],
+        chunk_length=lengths.astype(np.int32),
+    ), augmented_rewards.astype(np.float32)
+
+
+def _build_q_pretrain_dataset(agent, dataset, config, batch_size, seed):
+    """Invert all offline chunks once and cache all branching augmentations.
+
+    Synthetic transitions are terminal (mask=0), so their TD target is reward
+    only. Source next observations are retained as unused batch placeholders.
+    """
+    factor = config.get('increase_num', 2) ** config.get('noise_add_start', 2)
+    variants = 1 + factor
+    output = None
+    rng = jax.random.PRNGKey(seed + 50000)
+    horizon = config['horizon_length'] if config['action_chunking'] else 1
+    for offset in tqdm.trange(0, dataset.size, batch_size, desc='GRACE invert/augment'):
+        starts = np.arange(offset, min(offset + batch_size, dataset.size))
+        chunk, failure_rewards = _offline_q_chunks(
+            dataset, starts, horizon, config['discount'],
+            config.get('chunk_reward_aggregation', 'max'))
+        latent = agent.inverse_fm_batch(chunk['observations'], chunk['true_actions'])
+        rng, branch_rng = jax.random.split(rng)
+        augmented = np.asarray(agent.augment_actions_from_z(
+            chunk['observations'], latent, branch_rng))
+        chunk['actions'] = np.asarray(latent)
+        expanded = {k: np.repeat(v, variants, axis=0) for k, v in chunk.items()}
+        expanded['masks'].reshape(len(starts), variants)[:, 1:] = 0.
+        expanded['terminals'].reshape(len(starts), variants)[:, 1:] = 1.
+        expanded['true_actions'] = np.concatenate(
+            [chunk['true_actions'][:, None, :], augmented], axis=1).reshape(
+                len(starts) * variants, -1)
+        expanded['rewards'] = np.concatenate(
+            [chunk['rewards'][:, None], np.repeat(failure_rewards[:, None], factor, axis=1)],
+            axis=1).reshape(-1)
+        if output is None:
+            output = {k: np.empty((dataset.size * variants, *v.shape[1:]), dtype=v.dtype)
+                      for k, v in expanded.items()}
+        for k, v in expanded.items():
+            output[k][offset * variants:(offset + len(starts)) * variants] = v
+    if output is None:
+        raise ValueError('pretrain_qnet requires a nonempty offline dataset')
+    print(f'Q pretraining: {dataset.size} original + {dataset.size * factor} augmented chunks; '
+          f'offline step rewards={np.unique(dataset["rewards"])}; augmented step reward=-1')
+    return Dataset.create(**output, numpy_rng=np.random.default_rng(seed + 60000))
+
+
+def _pretrain_qnet(agent, dataset, config, batch_size, seed, logger, log_step,
+                   maybe_shard):
+    pretrain_data = _build_q_pretrain_dataset(agent, dataset, config, batch_size, seed)
+    updates = 0
+    for epoch in range(config.get('pretrain_qnet_epochs', 1)):
+        order = pretrain_data.numpy_rng.permutation(pretrain_data.size)
+        for offset in tqdm.trange(0, pretrain_data.size, batch_size, desc=f'GRACE Q pretrain {epoch + 1}'):
+            indices = order[offset:offset + batch_size]
+            # Pad the last minibatch for a fixed compiled/sharded shape.
+            if len(indices) < batch_size:
+                indices = np.pad(indices, (0, batch_size - len(indices)), mode='wrap')
+            batch = pretrain_data.sample(batch_size, idxs=indices)
+            agent, metrics = agent.pretrain_action_q(maybe_shard(batch))
+            updates += 1
+            if updates == 1 or updates % 1000 == 0:
+                logger.log(dict(metrics, updates=updates, epoch=epoch + 1,
+                                dataset_size=pretrain_data.size),
+                           'q_pretrain', step=log_step + updates)
+    jax.block_until_ready(agent)
+    logger.log(dict(metrics, updates=updates, epoch=epoch + 1,
+                    dataset_size=pretrain_data.size),
+               'q_pretrain', step=log_step + updates + 1)
+    return agent, updates + 1
+
+
 def run_grace_online_rl(
     agent: Any,
     env: Any,
@@ -187,6 +282,12 @@ def run_grace_online_rl(
                 ob_images[None],
             )[0])
         return ob_split
+
+    if config.get('pretrain_qnet', False) and not is_resumed:
+        agent, pretrain_log_steps = _pretrain_qnet(
+            agent, train_dataset, config, batch_size, seed, logger, start_step, _maybe_shard)
+        start_step += pretrain_log_steps
+        save_agent(agent, save_dir, start_step)
 
     raw_ob, _ = env.reset(seed=seed + 10000)
     ob = _encode_ob(raw_ob)

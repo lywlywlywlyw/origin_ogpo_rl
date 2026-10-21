@@ -14,7 +14,10 @@ import numpy as np
 
 from ogpo.agents.dsrl import DSRLBestOfNAgent
 from ogpo.agents.grace import GRACEAgent
-from ogpo.runners.grace_runner import run_grace_online_rl
+from ogpo.runners.grace_runner import (
+    run_grace_online_rl, _offline_q_chunks, _build_q_pretrain_dataset,
+)
+from ogpo.utils.datasets import Dataset
 from ogpo.utils.config_loader import load_config, config_to_agent_dict
 
 
@@ -43,6 +46,118 @@ def assert_tree_equal(test, a, b):
 
 
 class GraceTests(unittest.TestCase):
+    def test_inverse_direction_and_branching(self):
+        class ConstantFlow:
+            def select(self, name):
+                return lambda obs, x, t: jnp.ones_like(x) * .2
+        _, agent = make_pair()
+        # Test the numerical methods against an exactly invertible vector field.
+        dummy = SimpleNamespace(config=dict(flow_steps=4, increase_num=2, noise_add_start=2),
+                                bc_flow_network=ConstantFlow())
+        obs = jnp.zeros((3, 3))
+        actions = jnp.full((3, 8), .3)
+        z = GRACEAgent.inverse_fm_batch.__wrapped__(dummy, obs, actions)
+        np.testing.assert_allclose(z, .1, atol=1e-6)
+        rng = jax.random.PRNGKey(23)
+        actual = GRACEAgent.augment_actions_from_z.__wrapped__(dummy, obs, z, rng)
+        x = z
+        for i in range(4):
+            x = x + .05
+            if i >= 2:
+                x = jnp.repeat(x, 2, axis=0)
+                rng, key = jax.random.split(rng)
+                x += jax.random.normal(key, x.shape)
+        np.testing.assert_allclose(actual, jnp.clip(x, -1, 1).reshape(3, 4, 8), atol=1e-6)
+        # Exercise the real decoder's compiled methods too.
+        real_z = agent.inverse_fm_batch(obs, actions)
+        real_a = agent.augment_actions_from_z(obs, real_z, rng)
+        self.assertEqual(real_a.shape, (3, 4, 8))
+        self.assertTrue(np.isfinite(real_a).all())
+        self.assertTrue(np.all(np.abs(real_a) <= 1.))
+
+    def test_q_pretrain_chunks_rewards_and_frozen_states(self):
+        _, agent = make_pair()
+        dataset = Dataset.create(
+            observations=np.arange(18, dtype=np.float32).reshape(6, 3),
+            next_observations=np.arange(18, dtype=np.float32).reshape(6, 3) + .5,
+            actions=np.arange(12, dtype=np.float32).reshape(6, 2) / 20,
+            rewards=np.array([-1, -1, 0, -1, -1, 0], dtype=np.float32),
+            terminals=np.array([0, 0, 1, 0, 0, 1], dtype=np.float32),
+            masks=np.array([1, 1, 0, 1, 1, 0], dtype=np.float32))
+        chunks, failures = _offline_q_chunks(dataset, np.array([0, 2, 3, 5]), 4, .99,
+                                              'discounted_sum')
+        np.testing.assert_array_equal(chunks['chunk_length'], [3, 1, 3, 1])
+        np.testing.assert_allclose(chunks['rewards'], [-1.99, 0, -1.99, 0])
+        np.testing.assert_allclose(failures, [-2.9701, -1, -2.9701, -1])
+        np.testing.assert_array_equal(chunks['next_observations'], dataset['next_observations'][[2,2,5,5]])
+        np.testing.assert_array_equal(chunks['true_actions'][1].reshape(4, 2),
+                                      np.tile(dataset['actions'][2], (4, 1)))
+        expanded = _build_q_pretrain_dataset(agent, dataset, dict(agent.config), 2, 1)
+        self.assertEqual(expanded.size, 30)
+        all_chunks, _ = _offline_q_chunks(dataset, np.arange(6), 4, .99, 'discounted_sum')
+        np.testing.assert_array_equal(expanded['true_actions'][::5], all_chunks['true_actions'])
+        np.testing.assert_allclose(expanded['rewards'][::5], all_chunks['rewards'])
+        self.assertEqual(expanded['rewards'][11], -1.)  # augmented success-step sample
+        np.testing.assert_array_equal(expanded['masks'][::5], all_chunks['masks'])
+        np.testing.assert_array_equal(expanded['terminals'][::5], all_chunks['terminals'])
+        synthetic = np.flatnonzero(np.arange(expanded.size) % 5 != 0)
+        np.testing.assert_array_equal(expanded['masks'][synthetic], 0.)
+        np.testing.assert_array_equal(expanded['terminals'][synthetic], 1.)
+        synthetic_batch = expanded.sample(len(synthetic), idxs=synthetic)
+        loss_rng = jax.random.PRNGKey(23)
+        loss, metrics = agent.action_critic_loss(
+            synthetic_batch, agent.action_critic_network.params, loss_rng)
+        predicted = agent.action_critic_network.select('critic')(
+            synthetic_batch['observations'], actions=synthetic_batch['true_actions'])
+        np.testing.assert_allclose(loss, jnp.mean(
+            (predicted - synthetic_batch['rewards'][None]) ** 2), rtol=1e-6)
+        np.testing.assert_allclose(metrics['action_critic/target_q_mean'],
+                                   synthetic_batch['rewards'].mean(), rtol=1e-6)
+        changed_next = dict(synthetic_batch,
+                            next_observations=synthetic_batch['next_observations'] + 100.)
+        changed_loss, _ = agent.action_critic_loss(
+            changed_next, agent.action_critic_network.params, loss_rng)
+        np.testing.assert_allclose(changed_loss, loss, rtol=1e-6)
+        # One pretraining update is precisely the online action-Q TD/target update.
+        data = expanded.sample(4, idxs=np.arange(4))
+        new_rng, loss_rng = jax.random.split(agent.rng)
+        expected, _ = agent.action_critic_network.apply_loss_fn(
+            lambda p: agent.action_critic_loss(data, p, loss_rng))
+        agent.target_update(expected, 'critic')
+        updated, info = agent.pretrain_action_q(data)
+        assert_tree_equal(self, expected, updated.action_critic_network)
+        for field in ('actor_network', 'bc_flow_network', 'critic_network'):
+            assert_tree_equal(self, getattr(agent, field), getattr(updated, field))
+        self.assertTrue(np.isfinite(info['action_critic/loss']))
+        np.testing.assert_array_equal(updated.rng, new_rng)
+        class Env:
+            def reset(self, seed):
+                return np.zeros(3, dtype=np.float32), {}
+            def step(self, action):
+                return np.zeros(3, dtype=np.float32), -1., True, False, {'success': 0.}
+        class Logger:
+            def log(self, *args, **kwargs):
+                pass
+        enabled = agent.replace(config=agent.config.copy(dict(pretrain_qnet=True)))
+        with patch('ogpo.runners.grace_runner.save_agent'), patch(
+                'ogpo.runners.grace_runner._run_evaluation', return_value={}):
+            continued, log_step, _, _ = run_grace_online_rl(
+                enabled, Env(), Env(), None, dataset, dict(enabled.config), Logger(), '/unused',
+                'grace', online_steps=1, start_training=20, batch_size=4,
+                horizon_length=4, discount=.99, n_eval_envs=1,
+                eval_interval=-1, log_interval=-1, save_interval=-1, buffer_size=100)
+        self.assertEqual(log_step, 10)  # 8 Q updates + final Q log + 1 env step
+        self.assertEqual(int(continued.action_critic_network.step),
+                         int(agent.action_critic_network.step) + 8)
+        for field in ('actor_network', 'bc_flow_network', 'critic_network'):
+            assert_tree_equal(self, getattr(agent, field), getattr(continued, field))
+        for name, value in [('increase_num', 0), ('noise_add_start', -1),
+                            ('pretrain_qnet_epochs', 0), ('increase_num', 1.5),
+                            ('noise_add_start', 11)]:
+            with self.assertRaisesRegex(ValueError, name):
+                GRACEAgent.create(1, jnp.zeros(3), jnp.zeros(2),
+                                  dict(agent.config, pretrain_qnet=True, **{name: value}))
+
     def test_encoder_clip_sampling_losses_and_prior(self):
         config = config_to_agent_dict(load_config('grace_ogpo_square_shared'))
         config.update(actor_hidden_dims=(8, 8), value_hidden_dims=(8, 8), num_qs=2,

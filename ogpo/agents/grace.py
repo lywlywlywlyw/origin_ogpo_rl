@@ -103,6 +103,53 @@ class GRACEAgent(flax.struct.PyTreeNode):
         return loss, {'action_critic/loss': loss, 'action_critic/q_mean': q.mean(),
                       'action_critic/target_q_mean': target.mean()}
 
+    @jax.jit
+    def pretrain_action_q(self, batch):
+        """Use exactly the online action-Q TD update, freezing actor/decoder/Qz."""
+        new_rng, loss_rng = jax.random.split(self.rng)
+        state, info = self.action_critic_network.apply_loss_fn(
+            lambda p: self.action_critic_loss(batch, p, loss_rng))
+        self.target_update(state, 'critic')
+        return self.replace(action_critic_network=state, rng=new_rng), info
+
+    @jax.jit
+    def inverse_fm_batch(self, observations, actions):
+        """Reverse Euler integration of this decoder (action t=1 to latent t=0).
+
+        Unlike the GoRL reference, OGPO trains its flow from noise at t=0
+        to actions at t=1. Do not clip or constrain the recovered latent.
+        """
+        if observations.shape[0] != actions.shape[0] or actions.ndim != 2:
+            raise ValueError('Inverse FM expects equally sized observation/action batches')
+        steps = self.config['flow_steps']
+
+        def step(x, i):
+            t = jnp.full((x.shape[0], 1), 1. - i / steps)
+            velocity = self.bc_flow_network.select('actor_bc_flow')(observations, x, t)
+            return x - velocity / steps, None
+
+        return jax.lax.scan(step, actions, jnp.arange(steps))[0]
+
+    @jax.jit
+    def augment_actions_from_z(self, observations, latents, rng):
+        """Branch after each of the final K Euler steps; return (B, N**K, A)."""
+        steps = self.config['flow_steps']
+        branch_steps = self.config['noise_add_start']
+        increase_num = self.config['increase_num']
+        batch_size, action_dim = latents.shape
+        x = latents
+        obs = observations
+        for i in range(steps):
+            t = jnp.full((x.shape[0], 1), i / steps)
+            velocity = self.bc_flow_network.select('actor_bc_flow')(obs, x, t)
+            x = x + velocity / steps
+            if i >= steps - branch_steps:
+                x = jnp.repeat(x, increase_num, axis=0)
+                obs = jnp.repeat(obs, increase_num, axis=0)
+                rng, noise_rng = jax.random.split(rng)
+                x = x + jax.random.normal(noise_rng, x.shape, dtype=x.dtype)
+        return jnp.clip(x, -1., 1.).reshape(batch_size, increase_num ** branch_steps, action_dim)
+
     def input_gradient_metrics(self, batch):
         """Pre-update online-Q gradients, at paired replay (s, z, a).
 
@@ -527,6 +574,15 @@ class GRACEAgent(flax.struct.PyTreeNode):
         config.setdefault('use_layer_norm', False)
         if config['use_layer_norm']:
             config['num_qs'] = 10
+        config.setdefault('pretrain_qnet', False)
+        config.setdefault('increase_num', 2)
+        config.setdefault('noise_add_start', 2)
+        config.setdefault('pretrain_qnet_epochs', 1)
+        for name in ('increase_num', 'noise_add_start', 'pretrain_qnet_epochs'):
+            if isinstance(config[name], bool) or not isinstance(config[name], int) or config[name] < 1:
+                raise ValueError(f'{name} must be a positive integer')
+        if config['pretrain_qnet'] and not 1 <= config['noise_add_start'] <= config['flow_steps']:
+            raise ValueError('noise_add_start must not exceed flow_steps')
         config.setdefault('decoder_add_noise', False)
         config.setdefault('decoder_noise_std', 0.09)
         config.setdefault('decoder_noise_clip', 3.0)
