@@ -3,6 +3,7 @@
 Run via scripts/grace/eval_square_latent_priors.sh. --check-only checks the
 real decoder checkpoint and all samplers without creating any simulator.
 All evaluation metrics are printed to the terminal; no result files are saved.
+Each policy runs exactly 200 episodes (20 environments, 10 rounds).
 """
 
 import argparse
@@ -119,10 +120,10 @@ def main():
     from ogpo.utils.evaluation import evaluate_parallel
     from ogpo.utils.main_helper import make_vectorized_env
 
-    n_envs = config['eval']['n_eval_envs']
-    episodes = config['eval']['eval_episodes']
-    if n_envs <= 1:
-        raise ValueError('This matched comparison requires parallel online evaluation.')
+    # Independent evaluation budget; leave the online training YAML unchanged.
+    # 200 is not divisible by the training setup's 32 parallel environments.
+    n_envs = 20
+    episodes = 10
     results = {}
     labels = {'A': 'Gaussian N(0,I)', 'B': 'tanh(Gaussian)',
               'C': 'Initialized actor (stochastic)'}
