@@ -67,18 +67,32 @@ class GRACEAgent(flax.struct.PyTreeNode):
         }
 
     def _aggregate_q(self, qs):
+        # SERL uses all ensemble members for the actor and online-Q values.
+        if self.config.get('use_layer_norm', False):
+            return jnp.mean(qs, axis=0)
         return jnp.min(qs, axis=0) if self.config['q_agg'] == 'min' else jnp.mean(qs, axis=0)
+
+    def _aggregate_td_target_q(self, qs, rng):
+        if not self.config.get('use_layer_norm', False):
+            return self._aggregate_q(qs)
+        # Match SERL/HIL-SERL REDQ: one pair per minibatch, sampled with
+        # replacement. Only the TD bootstrap uses the subsampled minimum;
+        # all ten critics still regress onto the shared target.
+        _, subsample_rng = jax.random.split(rng)
+        indices = jax.random.randint(subsample_rng, (2,), 0, self.config['num_qs'])
+        return jnp.min(qs[indices], axis=0)
 
     def action_critic_loss(self, batch, grad_params, rng):
         # Bootstrap Q^A at the next action decoded from the latent actor.
-        _, sample_rng = jax.random.split(rng)
+        target_rng, sample_rng = jax.random.split(rng)
         dist = self.actor_network.select('actor')(batch['next_observations'])
         next_z, log_probs = dist.sample_and_log_prob(seed=sample_rng)
         next_z = self.constrain_encoder_output(next_z)
         next_a = self.noise_to_actions_public(
             batch['next_observations'], next_z, noises_constrained=True)
-        next_q = self._aggregate_q(self.action_critic_network.select('target_critic')(
-            batch['next_observations'], actions=next_a))
+        next_qs = self.action_critic_network.select('target_critic')(
+            batch['next_observations'], actions=next_a)
+        next_q = self._aggregate_td_target_q(next_qs, target_rng)
         if self.config['entropy_backup']:
             next_q -= self.actor_network.select('temp')() * jnp.clip(log_probs, -100, 100)
         target = jnp.clip(batch['rewards'] + self.config['discount'] ** batch.get(
@@ -146,10 +160,7 @@ class GRACEAgent(flax.struct.PyTreeNode):
         actions = self.constrain_encoder_output(actions)
 
         qs = self.critic_network.select('critic')(batch['observations'], actions=actions)
-        if self.config['q_agg'] == 'min':
-            q = jnp.min(qs, axis=0)
-        else:
-            q = jnp.mean(qs, axis=0)
+        q = self._aggregate_q(qs)
 
         temp = self.actor_network.select('temp')()
         if delete_sac_entropy:
@@ -390,7 +401,8 @@ class GRACEAgent(flax.struct.PyTreeNode):
         return _get_q_values(
             critic_fn=self.critic_network.select('target_critic'),
             observations=observations, actions=actions,
-            q_agg=self.config['q_agg'], is_encoded=is_encoded,
+            q_agg='mean' if self.config.get('use_layer_norm', False) else self.config['q_agg'],
+            is_encoded=is_encoded,
         )
 
     @partial(jax.jit, static_argnames=('noises_constrained',))
@@ -497,6 +509,9 @@ class GRACEAgent(flax.struct.PyTreeNode):
         config = dict(config)
         config.setdefault('encoder_sphere_limit', False)
         config.setdefault('delete_sac_entropy', False)
+        config.setdefault('use_layer_norm', False)
+        if config['use_layer_norm']:
+            config['num_qs'] = 10
         config.setdefault('decoder_add_noise', False)
         config.setdefault('decoder_noise_std', 0.09)
         config.setdefault('decoder_noise_clip', 3.0)
@@ -547,7 +562,7 @@ class GRACEAgent(flax.struct.PyTreeNode):
 
         critic_def = Value(
             hidden_dims=config['value_hidden_dims'],
-            layer_norm=config['layer_norm'],
+            layer_norm=config['layer_norm'] or config['use_layer_norm'],
             num_ensembles=config['num_qs'],
             encoder=encoders.get('critic'),
             critic_loss_type=config['critic_loss_type'],
@@ -560,7 +575,7 @@ class GRACEAgent(flax.struct.PyTreeNode):
         actor_def = Actor(
             hidden_dims=config['actor_hidden_dims'],
             action_dim=noise_dim,
-            layer_norm=config['actor_layer_norm'],
+            layer_norm=config['actor_layer_norm'] or config['use_layer_norm'],
             encoder=encoders.get('actor'),
             tanh_squash=not config['encoder_sphere_limit'],
             state_dependent_std=True,
@@ -576,6 +591,8 @@ class GRACEAgent(flax.struct.PyTreeNode):
         if time_emb_type == 'sinusoidal':
             time_emb_module = SinusoidalTimeEmbedding(embed_dim=config.get('time_embedding_dim', 32))
 
+        # Keep the frozen decoder architecture independent of this switch so
+        # existing OGPO offline checkpoints remain structurally compatible.
         actor_bc_flow_def = ActorVectorField(
             hidden_dims=config['actor_hidden_dims'],
             action_dim=full_action_dim,

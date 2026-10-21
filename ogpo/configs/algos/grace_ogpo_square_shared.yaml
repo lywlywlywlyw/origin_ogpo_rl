@@ -5,6 +5,10 @@ experiment:
   wandb_name: grace_square_shared_ogpo_bc
 agent:
   agent_name: grace
+  # SERL-style Dense -> LayerNorm -> activation in the online actor and critics.
+  # Uses 10 Qs: min of 2 random Qs for TD backup; mean of all 10 for the actor
+  # and latent-Q distillation. Frozen offline decoder architecture is unchanged.
+  use_layer_norm: true
   # True: skip encoder tanh; use the LPS sphere for ALL decoder initial latents.
   encoder_sphere_limit: false
   # Independently disable SAC actor entropy and temperature (alpha) loss.

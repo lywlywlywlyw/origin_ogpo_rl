@@ -21,7 +21,7 @@ from ogpo.utils.config_loader import load_config, config_to_agent_dict
 def make_pair():
     config = config_to_agent_dict(load_config('grace_ogpo_square_shared'))
     config.update(actor_hidden_dims=(8, 8), value_hidden_dims=(8, 8), num_qs=2,
-                  encoder_sphere_limit=True)
+                  encoder_sphere_limit=True, use_layer_norm=False)
     dsrl = DSRLBestOfNAgent.create(1, jnp.zeros(3), jnp.zeros(2), dict(config))
     grace = GRACEAgent.create(1, jnp.zeros(3), jnp.zeros(2), dict(config))
     return dsrl, grace
@@ -58,11 +58,11 @@ class GraceTests(unittest.TestCase):
         np.testing.assert_allclose(jnp.linalg.norm(samples, axis=-1), jnp.sqrt(8.), atol=2e-5)
         self.assertTrue(np.any(np.abs(samples) > 1.))
         np.testing.assert_allclose(grace.sample_actions(observations, key),
-            grace.noise_to_actions_public(observations, expected), atol=1e-6)
+            grace.noise_to_actions_public(observations, expected, noises_constrained=True), atol=1e-6)
         mode = grace.constrain_encoder_output(dist.mode())
         np.testing.assert_allclose(grace.sample_noise(observations, deterministic=True), mode, atol=1e-6)
         np.testing.assert_allclose(grace.sample_actions(observations, deterministic=True),
-            grace.noise_to_actions_public(observations, mode), atol=1e-6)
+            grace.noise_to_actions_public(observations, mode, noises_constrained=True), atol=1e-6)
         zero = grace.constrain_encoder_output(jnp.zeros((2, 8)))
         np.testing.assert_array_equal(zero, np.zeros((2, 8)))
         for head in ('mean_net', 'log_std_net'):
@@ -99,7 +99,8 @@ class GraceTests(unittest.TestCase):
         expected = jnp.mean(grace.actor_network.select('temp')() * log_probs - q)
         np.testing.assert_allclose(info['actor_loss'], expected, rtol=1e-6)
         next_z = grace.sample_noise(data['next_observations'], key)
-        next_a = grace.noise_to_actions_public(data['next_observations'], next_z)
+        next_a = grace.noise_to_actions_public(
+            data['next_observations'], next_z, noises_constrained=True)
         next_q = grace._aggregate_q(grace.action_critic_network.select('target_critic')(
             data['next_observations'], actions=next_a))
         target = jnp.clip(data['rewards'] + .99 ** data['chunk_length'] * data['masks'] * next_q,
@@ -155,6 +156,108 @@ class GraceTests(unittest.TestCase):
         default = GRACEAgent.create(1, jnp.zeros(3), jnp.zeros(2), config)
         np.testing.assert_array_equal(default.sample_noise(observations, key),
                                       grace.sample_noise(observations, key))
+
+    def test_layer_norm_online_networks_and_offline_checkpoint(self):
+        _, template = make_pair()
+        config = dict(template.config, encoder_sphere_limit=False,
+                      actor_layer_norm=False, layer_norm=False)
+        baseline = GRACEAgent.create(9, jnp.zeros(3), jnp.zeros(2), config)
+        agent = GRACEAgent.create(9, jnp.zeros(3), jnp.zeros(2),
+                                 dict(config, use_layer_norm=True, num_qs=3))
+        self.assertEqual(agent.config['num_qs'], 10)
+        self.assertEqual(agent.config['actor_hidden_dims'], baseline.config['actor_hidden_dims'])
+        self.assertEqual(agent.config['value_hidden_dims'], baseline.config['value_hidden_dims'])
+
+        def norm_scales(params):
+            return [value for path, value in jax.tree_util.tree_flatten_with_path(params)[0]
+                    if any('LayerNorm' in str(getattr(key, 'key', key)) for key in path)
+                    and getattr(path[-1], 'key', None) == 'scale']
+
+        self.assertFalse(norm_scales(baseline.actor_network.params))
+        self.assertFalse(norm_scales(baseline.critic_network.params))
+        self.assertEqual([v.shape for v in norm_scales(agent.actor_network.params)],
+                         [(8,), (8,)])
+        for network in (agent.critic_network, agent.action_critic_network):
+            for module in ('modules_critic', 'modules_target_critic'):
+                self.assertEqual([v.shape for v in norm_scales(network.params[module])],
+                                 [(10, 8), (10, 8)])
+            self.assertEqual(network.select('critic')(
+                jnp.zeros((3, 3)), actions=jnp.zeros((3, 8))).shape, (10, 3))
+        self.assertFalse(norm_scales(agent.bc_flow_network.params))
+        assert_tree_equal(self, agent.bc_flow_network.params, baseline.bc_flow_network.params)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'offline.pkl'
+            with path.open('wb') as f:
+                pickle.dump({'agent': {'actor_network': {'params': {
+                    'modules_actor': baseline.bc_flow_network.params['modules_actor_bc_flow']}}}}, f)
+            agent = agent.restore_bc_flow_params(path)
+        frozen = agent.bc_flow_network
+        # Both the ordinary and success-BC paths must keep the pretrained flow frozen.
+        for success in (False, True):
+            data = batch()
+            agent, info = agent.batch_update(data, data if success else None, success)
+            self.assertTrue(all(np.isfinite(np.asarray(value)).all() for value in info.values()))
+            assert_tree_equal(self, agent.bc_flow_network, frozen)
+        self.assertEqual(int(agent.action_critic_network.step), int(agent.critic_network.step))
+
+    def test_serl_subsampled_td_target_and_full_ensemble_actor(self):
+        _, template = make_pair()
+        agent = GRACEAgent.create(9, jnp.zeros(3), jnp.zeros(2),
+            dict(template.config, use_layer_norm=True, q_agg='min'))
+        rng = jax.random.PRNGKey(73)
+        # Match reference randint sampling (with replacement), shared across the batch.
+        qs = jnp.arange(30, dtype=jnp.float32).reshape(10, 3)
+        _, subsample_rng = jax.random.split(rng)
+        indices = jax.random.randint(subsample_rng, (2,), 0, 10)
+        np.testing.assert_array_equal(agent._aggregate_td_target_q(qs, rng),
+                                      qs[indices].min(axis=0))
+        np.testing.assert_allclose(agent._aggregate_q(qs), qs.mean(axis=0))
+
+        data = jax.tree.map(lambda x: x[0], batch())
+        target_rng, sample_rng = jax.random.split(rng)
+        next_z = agent.sample_noise(data['next_observations'], sample_rng)
+        next_a = agent.noise_to_actions_public(data['next_observations'], next_z,
+                                              noises_constrained=True)
+        next_qs = agent.action_critic_network.select('target_critic')(
+            data['next_observations'], actions=next_a)
+        next_q = agent._aggregate_td_target_q(next_qs, target_rng)
+        target = jnp.clip(data['rewards'] + .99 ** data['chunk_length'] * data['masks'] * next_q,
+                          -500., 500.)
+        predicted = agent.action_critic_network.select('critic')(
+            data['observations'], actions=data['true_actions'])
+        loss, info = agent.action_critic_loss(data, agent.action_critic_network.params, rng)
+        np.testing.assert_allclose(loss, jnp.mean((predicted - target[None]) ** 2), rtol=1e-5)
+        np.testing.assert_allclose(info['action_critic/target_q_mean'], target.mean(), atol=1e-6)
+        dist = agent.actor_network.select('actor')(data['observations'])
+        z, log_probs = dist.sample_and_log_prob(seed=sample_rng)
+        actor_qs = agent.critic_network.select('critic')(
+            data['observations'], actions=agent.constrain_encoder_output(z))
+        _, info = agent.actor_loss(data, agent.actor_network.params, rng)
+        expected = (agent.actor_network.select('temp')() * log_probs - actor_qs.mean(axis=0)).mean()
+        np.testing.assert_allclose(info['actor_loss'], expected, rtol=1e-5)
+        # Latent-Q distillation also uses the full online action-Q ensemble mean.
+        z = agent.constrain_encoder_output(jax.random.normal(rng, data['actions'].shape))
+        actions = agent.noise_to_actions_public(data['observations'], z, noises_constrained=True)
+        teacher = agent.action_critic_network.select('critic')(
+            data['observations'], actions=actions).mean(axis=0)
+        _, info = agent.critic_loss(data, agent.critic_network.params, rng)
+        np.testing.assert_allclose(info['target_q_mean'], teacher.mean(), atol=1e-6)
+
+    def test_layer_norm_disabled_preserves_legacy_q_aggregation(self):
+        _, agent = make_pair()
+        qs = jnp.arange(6, dtype=jnp.float32).reshape(2, 3)
+        rng = jax.random.PRNGKey(1)
+        for mode in ('mean', 'min'):
+            legacy = agent.replace(config=dict(agent.config, q_agg=mode))
+            expected = qs.mean(axis=0) if mode == 'mean' else qs.min(axis=0)
+            np.testing.assert_array_equal(legacy._aggregate_td_target_q(qs, rng), expected)
+        config = dict(agent.config)
+        config.pop('use_layer_norm')
+        default = GRACEAgent.create(1, jnp.zeros(3), jnp.zeros(2), config)
+        self.assertFalse(default.config['use_layer_norm'])
+        self.assertEqual(default.config['num_qs'], 2)
+        assert_tree_equal(self, default.actor_network.params, agent.actor_network.params)
+        assert_tree_equal(self, default.critic_network.params, agent.critic_network.params)
 
     def test_config_matches_dsrl(self):
         dsrl = load_config('dsrl_ogpo_square_shared')
