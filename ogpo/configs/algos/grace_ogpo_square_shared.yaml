@@ -6,7 +6,7 @@ experiment:
 agent:
   agent_name: grace
   # Offline action-Q TD pretraining before online collection (decoder stays frozen).
-  pretrain_qnet: true
+  pretrain_qnet: false
   increase_num: 2
   # Branch increase_num times after each of the final noise_add_start ODE steps.
   noise_add_start: 2

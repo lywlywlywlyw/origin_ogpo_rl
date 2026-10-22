@@ -1,0 +1,22 @@
+# Online fine-tuning from the completed offline BC checkpoint.
+_base_: ogpo_tool_hang.yaml
+experiment:
+  run_name: ogpo_toolhang_online
+  wandb_name: ogpo_toolhang_online
+training:
+  bc_pi_steps: 0
+  bc_q_steps: 0
+  calql_steps: 0
+  q_warmup_steps: 0
+  bc_refine_steps: 0
+  bc_only: false
+  online_steps: 2000000
+eval:
+  n_eval_envs: 8
+  eval_episodes: 8
+checkpoint:
+  resume: false
+  restore_bc_flow_path: null
+  restore_actor_path: /root/OGPO_public/exp/ogpo/OGPO/toolhang/tool_hang-ph-low_dim/ogpo_toolhangseed1/params_500000.pkl
+  restore_critic_path: null
+  ep_resume: 500000

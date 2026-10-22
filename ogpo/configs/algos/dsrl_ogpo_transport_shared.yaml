@@ -1,0 +1,116 @@
+# Online training from the completed OGPO/transport BC checkpoint.
+_base_: dsrl.yaml
+experiment:
+  project: OGPO
+  run_group: transport
+  run_name: dsrl_transport_shared_ogpo_bc
+  wandb_name: dsrl_transport_shared_ogpo_bc
+  seed: 1
+  log: true
+  save_dir: exp/ogpo
+env:
+  name: transport-mh-low_dim
+  rew_fn: sparse
+  sparse: false
+  post_success_steps: 0
+training:
+  bc_pi_steps: 0
+  bc_q_steps: 0
+  calql_steps: 0
+  q_warmup_steps: 0
+  bc_refine_steps: 0
+  online_steps: 2000000
+  bc_only: false
+  force_jax_sync: true
+  gpu_mode: single
+buffer:
+  size: 2000000
+  start_training: 40000
+  utd_warmup: 1
+  utd_online: 1
+  utd_q: 1
+  utd_pi: 1
+  utd_v: null
+  offline_ratio: 0.0
+eval:
+  n_eval_envs: 8
+  eval_episodes: 8
+  video_episodes: 0
+  video_frame_skip: 3
+  plot_q_vs_mc: false
+intervals:
+  log_interval: 5000
+  eval_interval_bc: 5000
+  eval_interval: 20000
+  save_interval_bc: -1
+  save_interval: 500000
+  preemption_backup_interval: -1
+  step_data_log_interval: -1
+bc:
+  clip_bc: false
+  clip_bc_threshold: 0.45
+  clip_bc_wrt: SDE
+success_buffer:
+  use_success_buffer: true
+  batch_size: 256
+dataset:
+  proportion: 1.0
+  num_offline_trajs: -1
+  replace_interval: 1000
+  ogbench_dir: null
+  p_aug: 0.0
+checkpoint:
+  resume: false
+  restore_bc_flow_path: /root/OGPO_public/exp/ogpo/OGPO/transport/transport-mh-low_dim/ogpo_transportseed1/params_1000000.pkl
+  restore_actor_path: null
+  restore_critic_path: null
+  ep_resume: 1000000
+agent:
+  batch_size: 256
+  actor_hidden_dims:
+  - 512
+  - 512
+  - 512
+  - 512
+  - 512
+  value_hidden_dims:
+  - 512
+  - 512
+  - 512
+  - 512
+  - 512
+  actor_layer_norm: false
+  layer_norm: true
+  num_qs: 10
+  q_agg: mean
+  tau: 0.05
+  discount: 0.999
+  horizon_length: 8
+  action_chunking: true
+  encoder: null
+  actor_obs: state
+  critic_obs: state
+  use_state: proprio
+  time_embedding: sinusoidal
+  time_embedding_dim: 32
+  flow_steps: 10
+  ft_flow_steps: 10
+  act_min: -1.0
+  act_max: 1.0
+  denoised_clip_value: 1.0
+  bc_coeff: 1.0
+  agent_name: dsrl
+  updates_per_env_step: true
+  chunk_reward_aggregation: discounted_sum
+  use_success_buffer_q: true
+  action_magnitude: 1.0
+  noise_chunk_length: -1
+  best_of_n: 1
+  lr_actor: 0.0003
+  # OGPO reset_optimizers_with_lr actually uses ppo_lr for the critic.
+  lr_critic: 0.000045
+  optimizer_critic: adamw
+  critic_weight_decay: 0.00001
+  clip_grad_norm: 1000.0
+  # Match OGPO: an additional critic update when success-buffer Q is enabled.
+  critic_updates_per_actor: 2
