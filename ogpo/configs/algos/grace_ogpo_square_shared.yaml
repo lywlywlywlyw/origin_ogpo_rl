@@ -15,7 +15,9 @@ agent:
   # SERL-style Dense -> LayerNorm -> activation in the online actor and critics.
   # Uses 10 Qs: min of 2 random Qs for TD backup; mean of all 10 for the actor
   # and latent-Q distillation. Frozen offline decoder architecture is unchanged.
-  use_layer_norm: false
+  use_layer_norm: true
+  # Skip the encoder actor output tanh.
+  use_no_tanh: true
   # True: skip encoder tanh; use the LPS sphere for ALL decoder initial latents.
   encoder_sphere_limit: false
   # Replace encoder tanh with hard clip(raw Gaussian, -1, 1).

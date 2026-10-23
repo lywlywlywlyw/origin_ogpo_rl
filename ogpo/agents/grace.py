@@ -33,7 +33,7 @@ class GRACEAgent(flax.struct.PyTreeNode):
     """DSRL with action-Q distillation and input-sensitivity diagnostics.
 
     The actor and latent critic operate in noise space. Encoder outputs are
-    tanh-bounded, hard-clipped, or projected onto the LPS sphere of radius sqrt(noise_dim).
+    unsquashed, tanh-bounded, hard-clipped, or projected onto the LPS sphere of radius sqrt(noise_dim).
     The frozen flow maps the resulting latent to actions.
     The action critic learns chunk returns via TD. The latent critic regresses
     onto its values at actions decoded from the configured latent prior.
@@ -566,6 +566,7 @@ class GRACEAgent(flax.struct.PyTreeNode):
     @classmethod
     def create(cls, seed, ex_observations, ex_actions, config):
         config = dict(config)
+        config.setdefault('use_no_tanh', False)
         config.setdefault('encoder_sphere_limit', False)
         config.setdefault('use_encoder_clip', False)
         if config['use_encoder_clip'] and config['encoder_sphere_limit']:
@@ -648,7 +649,7 @@ class GRACEAgent(flax.struct.PyTreeNode):
             action_dim=noise_dim,
             layer_norm=config['actor_layer_norm'] or config['use_layer_norm'],
             encoder=encoders.get('actor'),
-            tanh_squash=not (config['encoder_sphere_limit'] or config['use_encoder_clip']),
+            tanh_squash=not (config['use_no_tanh'] or config['encoder_sphere_limit'] or config['use_encoder_clip']),
             state_dependent_std=True,
             low=-config["action_magnitude"],
             high=config["action_magnitude"],
