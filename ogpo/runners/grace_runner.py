@@ -13,6 +13,7 @@ import numpy as np
 import tqdm
 
 from ogpo.agents.modules.flax_utils import save_agent
+from ogpo.agents.grace import offline_iql_enabled, demo_buffer_enabled
 from ogpo.utils.datasets import Dataset, ReplayBuffer
 from ogpo.utils.evaluation import evaluate, evaluate_parallel, _split_obs
 from ogpo.utils.main_helper import LoggingHelper, save_rolling_checkpoint
@@ -54,6 +55,19 @@ def _run_evaluation(agent, eval_env, eval_envs, eval_flags, action_dim,
 
 def _reshape_for_utd(batch, utd_ratio, batch_size):
     return jax.tree.map(lambda x: x.reshape((utd_ratio, batch_size) + x.shape[1:]), batch)
+
+
+def _sample_demo_mixed_batch(replay, demo, batch_size, utd_ratio):
+    """Exactly half replay and half demo in EACH update, with paired (s,z,a)."""
+    if batch_size < 2 or batch_size % 2:
+        raise ValueError('Demo buffer requires an even online batch_size >= 2')
+    half = batch_size // 2
+    online = _reshape_for_utd(replay.sample(half * utd_ratio), utd_ratio, half)
+    offline = _reshape_for_utd(demo.sample(half * utd_ratio), utd_ratio, half)
+    # Exclude offline episode IDs and any auxiliary replay scoring metadata.
+    keys = ('observations', 'actions', 'true_actions', 'rewards',
+            'next_observations', 'masks', 'terminals', 'chunk_length')
+    return {key: np.concatenate((online[key], offline[key]), axis=1) for key in keys}
 
 
 def _sample_success_chunks(replay_buffer, batch_size):
@@ -220,6 +234,15 @@ def run_grace_online_rl(
     noise as 'actions' and denoised actions as 'true_actions'."""
     assert algo_name in GRACE_ALGORITHMS, f"Expected GRACE algorithm, got {algo_name}"
     assert offline_ratio == 0.0, f"GRACE requires offline_ratio=0.0, got {offline_ratio}"
+    use_demo = demo_buffer_enabled(config)
+    if use_demo:
+        if offline_iql_enabled(config):
+            raise ValueError('use_demo_buffer and use_offline_iql cannot be active together')
+        if batch_size < 2 or batch_size % 2:
+            raise ValueError('Demo buffer requires an even online batch_size >= 2')
+        # The demo mode uses only SAC on the 50/50 batch. A separate successful
+        # replay BC/critic batch would violate the requested update composition.
+        use_success_buffer = False
 
     example_batch = train_dataset.sample(())
     action_dim = example_batch['actions'].shape[-1]
@@ -286,7 +309,25 @@ def run_grace_online_rl(
             )[0])
         return ob_split
 
-    if config.get('pretrain_qnet', False) and not is_resumed:
+    demo_buffer = None
+    if use_demo or (offline_iql_enabled(config) and not is_resumed):
+        try:
+            max_episode_length = env.get_wrapper_attr('max_episode_length')
+        except AttributeError:
+            max_episode_length = getattr(env, 'max_episode_length', None)
+    if use_demo:
+        from ogpo.runners.grace_iql import build_latent_iql_dataset
+        demo_buffer = build_latent_iql_dataset(
+            agent, train_dataset, config, seed, max_episode_length,
+            batch_size=config.get('demo_inverse_batch_size', 256), purpose='GRACE demo buffer')
+        print('GRACE demo mode: 50% replay + 50% demo per update; SAC only, no success-buffer BC')
+    if offline_iql_enabled(config) and not is_resumed:
+        from ogpo.runners.grace_iql import pretrain_latent_iql
+        agent, pretrain_log_steps = pretrain_latent_iql(
+            agent, train_dataset, seed, logger, start_step, _maybe_shard, max_episode_length)
+        start_step += pretrain_log_steps
+        save_agent(agent, save_dir, start_step)
+    elif config.get('pretrain_qnet', False) and not is_resumed:
         agent, pretrain_log_steps = _pretrain_qnet(
             agent, train_dataset, config, batch_size, seed, logger, start_step, _maybe_shard)
         start_step += pretrain_log_steps
@@ -424,7 +465,7 @@ def run_grace_online_rl(
             utd_ratio = utd_online * eligible_steps if per_env_updates else utd_online
             if utd_ratio == 0:
                 continue
-            min_required = batch_size * utd_ratio
+            min_required = (batch_size // 2 if use_demo else batch_size) * utd_ratio
             if replay_buffer.size < min_required:
                 if per_env_updates:
                     raise RuntimeError(
@@ -432,8 +473,11 @@ def run_grace_online_rl(
                         f'env step {total_env_step}; refusing to silently skip updates')
                 continue
 
-            batch = replay_buffer.sample(batch_size * utd_ratio)
-            batch = _reshape_for_utd(batch, utd_ratio, batch_size)
+            if use_demo:
+                batch = _sample_demo_mixed_batch(replay_buffer, demo_buffer, batch_size, utd_ratio)
+            else:
+                batch = replay_buffer.sample(batch_size * utd_ratio)
+                batch = _reshape_for_utd(batch, utd_ratio, batch_size)
 
             batch_success = None
             success_flag = False

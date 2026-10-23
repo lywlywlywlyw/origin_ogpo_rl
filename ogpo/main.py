@@ -43,7 +43,7 @@ from ogpo.agents.ogpo import OGPOAgent
 from ogpo.agents.qc import ACFQLAgent
 from ogpo.agents.bptt import OGPOBPTTAgent
 from ogpo.agents.dsrl import DSRLBestOfNAgent
-from ogpo.agents.grace import GRACEAgent
+from ogpo.agents.grace import GRACEAgent, offline_iql_enabled, demo_buffer_enabled
 from ogpo.runners.grace_runner import run_grace_online_rl
 from ogpo.agents.anchorq import AnchorQAgent
 from ogpo.runners.anchorq_runner import run_anchorq_online_rl
@@ -253,6 +253,11 @@ def main():
         "ogpo_bptt",
         "expo",
     ]
+    if algo_name == 'grace' and (offline_iql_enabled(agent_config) or demo_buffer_enabled(agent_config)):
+        from ogpo.runners.grace_iql import with_demo_boundaries
+        # Preserve real demo boundaries through subsampling/pre-encoding. Raw
+        # robomimic dones can mark every post-success row as a separate episode.
+        train_dataset = with_demo_boundaries(train_dataset)
     train_dataset = process_train_dataset(
         train_dataset,
         env_name,

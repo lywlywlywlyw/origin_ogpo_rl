@@ -207,6 +207,7 @@ def get_dataset(env, env_name):
     actions = []
     next_observations = []  # always proprioceptive state
     terminals = []
+    demo_ends = []  # True HDF5 demo boundaries, distinct from repeated success dones.
     rewards = []
     masks = []
     all_full_states = []    # full low-dim state for image envs (includes object pose)
@@ -277,6 +278,9 @@ def get_dataset(env, env_name):
         actions.append(a.astype(np.float32))
         rewards.append(r.astype(np.float32))
         terminals.append(dones.astype(np.float32))
+        episode_end = np.zeros(len(a), dtype=np.float32)
+        episode_end[-1] = 1.
+        demo_ends.append(episode_end)
         masks.append(1.0 - dones.astype(np.float32))
 
     dataset_fields = dict(
@@ -294,7 +298,10 @@ def get_dataset(env, env_name):
         dataset_fields['full_states'] = np.concatenate(all_full_states, axis=0)
         dataset_fields['next_full_states'] = np.concatenate(all_next_full_states, axis=0)
 
-    return Dataset.create(**dataset_fields)
+    dataset = Dataset.create(**dataset_fields)
+    # Metadata only: do not add a training-batch field or alter existing dones.
+    dataset.demo_ends = np.concatenate(demo_ends)
+    return dataset
 
 
 class RobomimicLowdimWrapper(gym.Env):

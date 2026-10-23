@@ -14,10 +14,39 @@ agent:
   pretrain_qnet_epochs: 1
   # SERL-style Dense -> LayerNorm -> activation in the online actor and critics.
   # Uses 10 Qs: min of 2 random Qs for TD backup; mean of all 10 for the actor
-  # and latent-Q distillation. Frozen offline decoder architecture is unchanged.
+  # and (in the original mode) latent-Q distillation. Decoder stays unchanged.
   use_layer_norm: true
-  # Both use_no_tanh and use_layer_norm true enable Qz distillation from
-  # 50% Gaussian + 25% replay + 25% actor latents (same total batch size).
+  # Effective only with use_layer_norm=true AND use_no_tanh=true.
+  # Frozen decoder builds a demo buffer before online RL. Every update uses
+  # 50% online replay + 50% demo; actor remains SAC on both state sources.
+  # Qz distillation uses only N(0,I), and success-buffer BC is bypassed.
+  # Mutually exclusive with active use_offline_iql.
+  use_demo_buffer: true
+  demo_inverse_batch_size: 256
+  # Effective only when use_layer_norm AND use_no_tanh are also true.
+  # True: frozen-decoder offline inversion + latent IQL, followed
+  # by direct online latent TD. No action-Q training or distillation.
+  # This takes precedence over pretrain_qnet above.
+  # False: original action-Q TD + Gaussian-prior latent-Q distillation.
+  # Distillation uses the same sampling path regardless of demo-buffer mode.
+  use_offline_iql: false
+  iql_steps: 500000
+  iql_batch_size: 256
+  iql_expectile: 0.8
+  iql_temperature: 0.1
+  iql_max_adv_weight: 100.0
+  iql_tau: 0.005
+  iql_actor_lr: 0.0003
+  iql_critic_lr: 0.0001
+  iql_value_lr: 0.0001
+  iql_clip_grad_norm: 0.5
+  # Held-out trajectories; restore the best validation state before online RL.
+  iql_validation_fraction: 0.05
+  iql_validation_interval: 1000
+  iql_validation_batches: 32
+  iql_early_stopping_min_steps: 100000
+  iql_early_stopping_patience: 50
+  iql_early_stopping_actor_nll_weight: 0.01
   # Skip the encoder actor output tanh.
   use_no_tanh: true
   # True: skip encoder tanh; use the LPS sphere for ALL decoder initial latents.

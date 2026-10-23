@@ -192,9 +192,12 @@ def make_env_and_datasets(env_name, frame_stack=None, action_clip_eps=1e-5, rew_
 
     # Clip dataset actions.
     if action_clip_eps is not None:
+        demo_ends = getattr(train_dataset, 'demo_ends', None)
         train_dataset = train_dataset.copy(
             add_or_replace=dict(actions=np.clip(train_dataset['actions'], -1 + action_clip_eps, 1 - action_clip_eps))
         )
+        if demo_ends is not None:
+            train_dataset.demo_ends = demo_ends
         if val_dataset is not None:
             val_dataset = val_dataset.copy(
                 add_or_replace=dict(actions=np.clip(val_dataset['actions'], -1 + action_clip_eps, 1 - action_clip_eps))

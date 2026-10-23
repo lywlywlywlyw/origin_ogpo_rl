@@ -29,6 +29,16 @@ from ogpo.agents.modules.pg_helper import (
     sample_flow_actions_ode,
 )
 
+def offline_iql_enabled(config):
+    return all(config.get(key, False) for key in
+               ('use_layer_norm', 'use_no_tanh', 'use_offline_iql'))
+
+
+def demo_buffer_enabled(config):
+    return all(config.get(key, False) for key in
+               ('use_layer_norm', 'use_no_tanh', 'use_demo_buffer'))
+
+
 class GRACEAgent(flax.struct.PyTreeNode):
     """DSRL with action-Q distillation and input-sensitivity diagnostics.
 
@@ -36,8 +46,8 @@ class GRACEAgent(flax.struct.PyTreeNode):
     unsquashed, tanh-bounded, hard-clipped, or projected onto the LPS sphere of radius sqrt(noise_dim).
     The frozen flow maps the resulting latent to actions.
     The action critic learns chunk returns via TD. The latent critic regresses
-    onto its values at decoded latents. With both use_no_tanh and
-    use_layer_norm, distillation mixes prior, replay, and actor latents.
+    onto its values at decoded latents. With use_no_tanh, use_layer_norm and
+    use_offline_iql, offline latent IQL precedes direct online latent TD instead.
     """
 
     rng: Any
@@ -46,28 +56,99 @@ class GRACEAgent(flax.struct.PyTreeNode):
     bc_flow_network: TrainState
     action_critic_network: TrainState
     config: Any = nonpytree_field()
+    value_network: Any = None
+
+    @property
+    def latent_iql_enabled(self):
+        return offline_iql_enabled(self.config)
+
+    def latent_td_loss(self, batch, grad_params, rng):
+        target_rng, sample_rng = jax.random.split(rng)
+        dist = self.actor_network.select('actor')(batch['next_observations'])
+        next_z, log_prob = dist.sample_and_log_prob(seed=sample_rng)
+        next_z = self.constrain_actor_output(next_z)
+        next_q = self._aggregate_td_target_q(
+            self.critic_network.select('target_critic')(
+                batch['next_observations'], actions=next_z), target_rng)
+        if self.config['entropy_backup']:
+            next_q -= self.actor_network.select('temp')() * jnp.clip(log_prob, -100, 100)
+        target = jax.lax.stop_gradient(batch['rewards'] + self.config['discount'] ** batch.get(
+            'chunk_length', self.config['horizon_length']) * batch['masks'] * next_q)
+        q = self.critic_network.select('critic')(
+            batch['observations'], actions=batch['actions'], params=grad_params)
+        loss = jnp.mean(jnp.square(q - target))
+        return loss, {'critic_loss': loss, 'td_loss': loss,
+                      'q_mean': q.mean(), 'target_q_mean': target.mean()}
+
+    @jax.jit
+    def iql_validation_metrics(self, batch):
+        """GoRL held-out score; use all target heads, without random subsampling."""
+        target_q = self.critic_network.select('target_critic')(
+            batch['observations'], actions=batch['actions']).min(axis=0)
+        value = self.value_network.select('value')(batch['observations'])
+        diff = target_q - value
+        value_loss = jnp.mean(jnp.where(diff > 0, self.config['iql_expectile'],
+                                       1 - self.config['iql_expectile']) * diff ** 2)
+        next_v = self.value_network.select('value')(batch['next_observations'])
+        target = batch['rewards'] + self.config['discount'] ** batch['chunk_length'] * batch['masks'] * next_v
+        q = self.critic_network.select('critic')(batch['observations'], actions=batch['actions'])
+        td_loss = jnp.mean((q - target) ** 2)
+        relative_td = jnp.sqrt(td_loss) / jnp.maximum(jnp.mean(jnp.abs(target)), 1.)
+        relative_value = jnp.sqrt(value_loss) / jnp.maximum(jnp.mean(jnp.abs(target_q)), 1.)
+        dist = self.actor_network.select('actor')(batch['observations'])
+        nll = -jnp.mean(dist.log_prob(batch['actions'])) / batch['actions'].shape[-1]
+        score = relative_td + relative_value + self.config['iql_early_stopping_actor_nll_weight'] * nll
+        return dict(validation_score=score, validation_td_loss=td_loss,
+                    validation_value_loss=value_loss, validation_relative_td_rmse=relative_td,
+                    validation_relative_value_rmse=relative_value, validation_actor_nll_per_dim=nll)
+
+    @jax.jit
+    def pretrain_latent_iql(self, batch):
+        """GoRL's V -> advantage-weighted actor -> Q update, on inverted chunks."""
+        rng, key = jax.random.split(self.rng)
+        target_q = jax.lax.stop_gradient(self._aggregate_td_target_q(
+            self.critic_network.select('target_critic')(
+                batch['observations'], actions=batch['actions']), key))
+
+        def value_loss(p):
+            v = self.value_network.select('value')(batch['observations'], params=p)
+            diff = target_q - v
+            weight = jnp.where(diff > 0, self.config['iql_expectile'], 1 - self.config['iql_expectile'])
+            loss = jnp.mean(weight * diff ** 2)
+            return loss, {'value_loss': loss, 'value_mean': v.mean()}
+        value, vi = self.value_network.apply_loss_fn(value_loss)
+        advantage = jax.lax.stop_gradient(target_q - value.select('value')(batch['observations']))
+        weights = jnp.exp(jnp.minimum(advantage * self.config['iql_temperature'],
+                                     jnp.log(self.config['iql_max_adv_weight'])))
+
+        def actor_loss(p):
+            dist = self.actor_network.select('actor')(batch['observations'], params=p)
+            loss = -jnp.mean(weights * dist.log_prob(batch['actions']))
+            return loss, {'actor_loss': loss, 'advantage_mean': advantage.mean(),
+                          'advantage_weight_mean': weights.mean()}
+        actor, ai = self.actor_network.apply_loss_fn(actor_loss)
+        next_v = value.select('value')(batch['next_observations'])
+        target = jax.lax.stop_gradient(batch['rewards'] + self.config['discount'] ** batch[
+            'chunk_length'] * batch['masks'] * next_v)
+
+        def q_loss(p):
+            q = self.critic_network.select('critic')(
+                batch['observations'], actions=batch['actions'], params=p)
+            loss = jnp.mean((q - target) ** 2)
+            return loss, {'critic_loss': loss, 'q_mean': q.mean(), 'target_mean': target.mean()}
+        critic, qi = self.critic_network.apply_loss_fn(q_loss)
+        critic.params['modules_target_critic'] = jax.tree.map(
+            lambda p, tp: self.config['iql_tau'] * p + (1 - self.config['iql_tau']) * tp,
+            critic.params['modules_critic'], critic.params['modules_target_critic'])
+        return self.replace(rng=rng, value_network=value, actor_network=actor,
+                            critic_network=critic), {**vi, **ai, **qi}
 
     def critic_loss(self, batch, grad_params, rng):
+        if self.latent_iql_enabled:
+            return self.latent_td_loss(batch, grad_params, rng)
         # Use the same latent prior as the decoder, including sphere projection.
         noises = jax.random.normal(rng, batch['actions'].shape, dtype=batch['actions'].dtype)
         noises = self.constrain_encoder_output(noises)
-        mixed = (self.config.get('use_no_tanh', False)
-                 and self.config.get('use_layer_norm', False))
-        # Preserve state/latent pairing and the original batch size. Each quarter
-        # rounds down; any remainder stays Gaussian (B=256 gives 128/64/64).
-        quarter = batch['actions'].shape[0] // 4
-        if mixed and quarter:
-            indices = jax.random.permutation(jax.random.fold_in(rng, 1), noises.shape[0])
-            replay_indices = indices[:quarter]
-            actor_indices = indices[quarter:2 * quarter]
-            dist = self.actor_network.select('actor')(batch['observations'][actor_indices])
-            actor_noises = self.constrain_actor_output(
-                dist.sample(seed=jax.random.fold_in(rng, 2)))
-            noises = noises.at[replay_indices].set(batch['actions'][replay_indices])
-            noises = noises.at[actor_indices].set(actor_noises)
-            # This optimizer step trains only Qz, including when differentiating
-            # the loss through the agent's actor/replay inputs for diagnostics.
-            noises = jax.lax.stop_gradient(noises)
         actions = self.noise_to_actions_public(
             batch['observations'], noises, noises_constrained=True)
         target_q = jax.lax.stop_gradient(self._aggregate_q(
@@ -83,15 +164,6 @@ class GRACEAgent(flax.struct.PyTreeNode):
             'target_q_mean': target_q.mean(),
             'noise_mean': noises.mean(), 'noise_std': noises.std(),
         }
-        if mixed:
-            # Reuse the exact actor rows evaluated above; no extra decoder batch.
-            gap = (self._aggregate_q(q)[actor_indices] - target_q[actor_indices]
-                   if quarter else jnp.zeros((1,), dtype=q.dtype))
-            info.update(
-                actor_distillation_q_gap=gap.mean(),
-                actor_distillation_q_abs_gap=jnp.abs(gap).mean(),
-                actor_distillation_count=jnp.asarray(quarter),
-            )
         return critic_loss, info
 
     def _aggregate_q(self, qs):
@@ -208,6 +280,11 @@ class GRACEAgent(flax.struct.PyTreeNode):
         })
 
     def _critic_step(self, batch, rng):
+        if self.latent_iql_enabled:
+            state, info = self.critic_network.apply_loss_fn(
+                lambda p: self.critic_total_loss(batch, p, rng))
+            self.target_update(state, 'critic')
+            return self.replace(critic_network=state), info
         metrics = self.input_gradient_metrics(batch)
         action_rng, latent_rng = jax.random.split(rng)
         action_state, action_info = self.action_critic_network.apply_loss_fn(
@@ -595,6 +672,8 @@ class GRACEAgent(flax.struct.PyTreeNode):
     def create(cls, seed, ex_observations, ex_actions, config):
         config = dict(config)
         config.setdefault('use_no_tanh', False)
+        config.setdefault('use_offline_iql', False)
+        config.setdefault('use_demo_buffer', False)
         config.setdefault('encoder_sphere_limit', False)
         config.setdefault('use_encoder_clip', False)
         if config['use_encoder_clip'] and config['encoder_sphere_limit']:
@@ -603,6 +682,57 @@ class GRACEAgent(flax.struct.PyTreeNode):
         config.setdefault('use_layer_norm', False)
         if config['use_layer_norm']:
             config['num_qs'] = 10
+        config.setdefault('demo_inverse_batch_size', 256)
+        if demo_buffer_enabled(config):
+            if offline_iql_enabled(config):
+                raise ValueError('use_demo_buffer and use_offline_iql select incompatible online Q objectives')
+            if config['encoder_sphere_limit'] or config['use_encoder_clip']:
+                raise ValueError('Demo inverse latents require unconstrained encoder outputs')
+            if config['noise_chunk_length'] != -1 and config['horizon_length'] != 1:
+                raise ValueError('Demo inversion requires full-chunk noise')
+            if config.get('chunk_reward_aggregation') != 'discounted_sum':
+                raise ValueError('Demo buffer requires discounted_sum chunk rewards')
+            size = config['demo_inverse_batch_size']
+            if isinstance(size, bool) or not isinstance(size, int) or size < 1:
+                raise ValueError('demo_inverse_batch_size must be a positive integer')
+        for key, default in dict(iql_steps=500000, iql_batch_size=256,
+                                 iql_expectile=.8, iql_temperature=.1,
+                                 iql_max_adv_weight=100., iql_tau=.005,
+                                 iql_actor_lr=3e-4, iql_critic_lr=1e-4,
+                                 iql_value_lr=1e-4, iql_clip_grad_norm=.5,
+                                 iql_validation_fraction=.05, iql_validation_interval=1000,
+                                 iql_validation_batches=32, iql_early_stopping_min_steps=100000,
+                                 iql_early_stopping_patience=50,
+                                 iql_early_stopping_actor_nll_weight=.01).items():
+            config.setdefault(key, default)
+        if offline_iql_enabled(config):
+            if config['encoder_sphere_limit'] or config['use_encoder_clip']:
+                raise ValueError('Latent IQL requires unconstrained encoder latents')
+            if config['noise_chunk_length'] != -1 and config['horizon_length'] != 1:
+                raise ValueError('Latent IQL inversion requires full-chunk noise')
+            if not 0 < config['iql_expectile'] < 1:
+                raise ValueError('iql_expectile must be between zero and one')
+            if config.get('chunk_reward_aggregation') != 'discounted_sum':
+                raise ValueError('Latent IQL requires discounted_sum chunk rewards')
+            for key in ('iql_temperature', 'iql_max_adv_weight', 'iql_tau',
+                        'iql_actor_lr', 'iql_critic_lr', 'iql_value_lr', 'iql_clip_grad_norm'):
+                if not math.isfinite(float(config[key])) or config[key] <= 0:
+                    raise ValueError(f'{key} must be finite and positive')
+            if config['iql_tau'] > 1:
+                raise ValueError('iql_tau must not exceed one')
+            if not 0 < config['iql_validation_fraction'] < 1:
+                raise ValueError('iql_validation_fraction must be between zero and one')
+            if (not math.isfinite(config['iql_early_stopping_actor_nll_weight'])
+                    or config['iql_early_stopping_actor_nll_weight'] < 0):
+                raise ValueError('iql_early_stopping_actor_nll_weight must be finite and nonnegative')
+            if (isinstance(config['iql_early_stopping_min_steps'], bool)
+                    or not isinstance(config['iql_early_stopping_min_steps'], int)
+                    or config['iql_early_stopping_min_steps'] < 0):
+                raise ValueError('iql_early_stopping_min_steps must be a nonnegative integer')
+            for key in ('iql_steps', 'iql_batch_size', 'iql_validation_interval',
+                        'iql_validation_batches', 'iql_early_stopping_patience'):
+                if isinstance(config[key], bool) or not isinstance(config[key], int) or config[key] < 1:
+                    raise ValueError(f'{key} must be a positive integer')
         config.setdefault('pretrain_qnet', False)
         config.setdefault('increase_num', 2)
         config.setdefault('noise_add_start', 2)
@@ -794,4 +924,16 @@ class GRACEAgent(flax.struct.PyTreeNode):
         if config['target_entropy'] is None:
             config['target_entropy'] = -float(noise_dim) / 2
 
-        return cls(rng, actor_state, critic_state, bc_flow_state, action_critic_state, config=flax.core.FrozenDict(**config))
+        value_state = None
+        if offline_iql_enabled(config):
+            value_def = ModuleDict({'value': Value(
+                hidden_dims=config['value_hidden_dims'], layer_norm=True,
+                num_ensembles=1, encoder=copy.deepcopy(encoders.get('critic')),
+                **_two_tier_kwargs)})
+            value_params = value_def.init(jax.random.fold_in(critic_rng, 2),
+                                          value=(ex_observations,))['params']
+            value_state = TrainState.create(value_def, value_params, optax.chain(
+                optax.clip_by_global_norm(config['iql_clip_grad_norm']),
+                optax.adam(config['iql_value_lr'])))
+
+        return cls(rng, actor_state, critic_state, bc_flow_state, action_critic_state, config=flax.core.FrozenDict(**config), value_network=value_state)
