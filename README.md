@@ -77,6 +77,18 @@ number of passes. Pretraining updates only action Q and its target using the onl
 TD loss, then keeps those parameters and optimizer state for online training.
 Metrics are recorded under `q_pretrain`.
 
+AnchorQ uses the same square BC checkpoint and baseline network widths, with
+flow-reversed cardinal anchors, a base-prior defer candidate, and value-tilted
+particle barycenters instead of a latent SAC actor:
+
+```bash
+bash scripts/anchorq/square_shared_ogpo_bc.sh
+```
+
+Its matched configuration is `ogpo/configs/algos/anchorq_ogpo_square_shared.yaml`.
+See [the implementation notes](scripts/anchorq/README.md) for the reference-action
+adapter, adaptive particle rules, and differences from the paper's benchmark setup.
+
 Runs log to Weights & Biases. Set `WANDB_API_KEY` in your environment to log
 online; without it, W&B falls back to offline mode. Experiment data (per-run
 `flags.json` and CSV logs) is written under `exp/` and checkpoints under
@@ -96,6 +108,7 @@ export OGPO_CHECKPOINT_ROOT=/scratch/$USER/ogpo/ckpt  # checkpoints
 | `bptt/` | **BPTT** | Differentiate Q through the ODE sampled actions into the actor. |
 | `qc/` | **QC / ACFQL** | Action-chunked FQL; BON + SFT from Q. |
 | `dsrl/` | **DSRL** | SAC in the initial noise space of a frozen pretrained flow policy. |
+| `anchorq/` | **AnchorQ** | Flow-reversed action anchors, local Q-weighted latent particles, and epsilon-greedy selection with a frozen flow policy. |
 | `expo/` | **EXPO** | Learned Gaussian residuals on top of a frozen pretrained flow policy. |
 | `dsrl_plus_expo/` | **DSRL+EXPO** | DSRL noise actor + EXPO edit layer. |
 | `fql/` | **FQL** | OGPO with one-step distillation (`--agent.use_one_step_policy=true`). |

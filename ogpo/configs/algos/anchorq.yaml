@@ -1,0 +1,44 @@
+# AnchorQ Algorithms 1--4 (2610.22852v1), using existing baseline networks.
+_base_: dsrl.yaml
+agent:
+  agent_name: anchorq
+  # Robomimic OSC_POSE: +/- xyz, zero rotation, neutral gripper; repeated chunk.
+  # Command amplitude/gripper are explicit adaptations: paper benchmarks differ.
+  anchorq_reference_magnitude: 1.0
+  anchorq_reference_gripper: 0.0
+  anchorq_include_defer: true
+  # M ADDITIONAL particles; each cloud also contains the unperturbed anchor.
+  anchorq_particle_count: 32
+  anchorq_particle_sigma: 0.5
+  anchorq_particle_warmup_decisions: 10000
+  anchorq_sigma_ramp_decisions: 0
+  anchorq_adaptive_sigma: true
+  anchorq_sigma_min: 0.05
+  anchorq_sigma_max: 0.3
+  anchorq_tilt_beta: 1.0
+  anchorq_adaptive_beta: true
+  anchorq_uncertainty_floor: 0.01
+  anchorq_epsilon_start: 1.0
+  anchorq_epsilon_end: 0.05
+  anchorq_epsilon_decay_decisions: 10000
+  anchorq_target_aggregation: min
+  anchorq_target_heads: 2
+  # Appendix B: Q = trainable Value + kappa * frozen independent Value prior.
+  anchorq_prior_scale: 2.0
+  anchorq_prioritized_replay: true
+  # Paper does not tabulate PER exponents: explicit Robomimic choices.
+  anchorq_per_alpha: 0.6
+  anchorq_per_beta_start: 0.4
+  anchorq_per_epsilon: 0.000001
+  # Bound Q inference activation memory for replay candidate/particle clouds.
+  anchorq_query_batch_size: 256
+
+training:
+  bc_pi_steps: 0
+  bc_q_steps: 0
+  calql_steps: 0
+  q_warmup_steps: 0
+  bc_refine_steps: 0
+  bc_only: false
+checkpoint:
+  resume: false

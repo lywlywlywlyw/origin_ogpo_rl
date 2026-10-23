@@ -45,6 +45,8 @@ from ogpo.agents.bptt import OGPOBPTTAgent
 from ogpo.agents.dsrl import DSRLBestOfNAgent
 from ogpo.agents.grace import GRACEAgent
 from ogpo.runners.grace_runner import run_grace_online_rl
+from ogpo.agents.anchorq import AnchorQAgent
+from ogpo.runners.anchorq_runner import run_anchorq_online_rl
 from ogpo.agents.pss import PSSAgent
 from ogpo.agents.gorl import GoRLAgent
 from ogpo.agents.expo import EXPOAgent
@@ -138,6 +140,7 @@ AGENTS = {
     "ogpo_bptt": OGPOBPTTAgent,
     "dsrl": DSRLBestOfNAgent,
     "grace": GRACEAgent,
+    "anchorq": AnchorQAgent,
     "dsrl_bon": DSRLBestOfNAgent,
     "pss": PSSAgent,
     "gorl": GoRLAgent,
@@ -168,7 +171,7 @@ def main():
     checkpoint_config = config["checkpoint"]
     agent_config = config_to_agent_dict(config)
 
-    if algo_name in ('pss', 'gorl', 'grace'):
+    if algo_name in ('pss', 'gorl', 'grace', 'anchorq'):
         if checkpoint_config.get('resume'):
             raise ValueError(f'{algo_name} requires checkpoint.resume=false')
         if any(train_config[key] for key in
@@ -184,6 +187,10 @@ def main():
             raise ValueError('GoRL resets its encoder/value; only restore the BC decoder')
         if train_config.get('gpu_mode', 'single') != 'single':
             raise ValueError('GoRL currently requires training.gpu_mode=single')
+
+    if algo_name == 'anchorq':
+        if checkpoint_config.get('restore_actor_path') or checkpoint_config.get('restore_critic_path'):
+            raise ValueError('AnchorQ initializes only its frozen decoder via restore_bc_flow_path')
 
     if algo_name not in AGENTS:
         raise ValueError(
@@ -392,8 +399,8 @@ def main():
     # Restore pre-trained weights
     flow_path = checkpoint_config.get('restore_bc_flow_path')
     if not is_resumed and flow_path:
-        if algo_name not in ('dsrl', 'pss', 'gorl', 'grace'):
-            raise ValueError('restore_bc_flow_path currently supports dsrl, pss, gorl and grace')
+        if algo_name not in ('dsrl', 'pss', 'gorl', 'grace', 'anchorq'):
+            raise ValueError('restore_bc_flow_path supports dsrl, pss, gorl, grace and anchorq')
         if train_config['bc_pi_steps'] != 0:
             raise ValueError('Shared BC flow initialization requires training.bc_pi_steps=0')
         agent = agent.restore_bc_flow_params(flow_path)
@@ -664,6 +671,8 @@ def main():
         )
     elif algo_name == 'grace':
         agent, log_step, final_eval_info, replay_buffer = run_grace_online_rl(**runner_kwargs)
+    elif algo_name == 'anchorq':
+        agent, log_step, final_eval_info, replay_buffer = run_anchorq_online_rl(**runner_kwargs)
     elif algo_name in DSRL_ALGORITHMS:
         agent, log_step, final_eval_info, replay_buffer = run_dsrl_online_rl(
             **runner_kwargs

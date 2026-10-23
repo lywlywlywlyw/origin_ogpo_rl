@@ -15,6 +15,7 @@ Layout is `scripts/<algorithm>/<env>.sh`:
 | `bptt/` | `bptt` | Backprop-through-time baseline. |
 | `qc/` | `qc` | Action-chunked FQL (ACFQL). |
 | `dsrl/` | `dsrl` | Noise-space SAC over a frozen flow. |
+| `anchorq/` | `anchorq_ogpo_square_shared` | Cached flow-reversed anchors and Q-tilted latent particles; [shared-checkpoint settings](anchorq/README.md). |
 | `expo/` | `expo` | Expressive policy with a learned edit head. |
 | `dsrl_plus_expo/` | `dsrl_plus_expo` | DSRL + EXPO edit layer. |
 | `fql/` | `ogpo` | FQL = OGPO with `--agent.use_one_step_policy=true`. |
