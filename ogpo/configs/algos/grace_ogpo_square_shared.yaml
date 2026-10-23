@@ -16,6 +16,8 @@ agent:
   # Uses 10 Qs: min of 2 random Qs for TD backup; mean of all 10 for the actor
   # and latent-Q distillation. Frozen offline decoder architecture is unchanged.
   use_layer_norm: true
+  # Both use_no_tanh and use_layer_norm true enable Qz distillation from
+  # 50% Gaussian + 25% replay + 25% actor latents (same total batch size).
   # Skip the encoder actor output tanh.
   use_no_tanh: true
   # True: skip encoder tanh; use the LPS sphere for ALL decoder initial latents.

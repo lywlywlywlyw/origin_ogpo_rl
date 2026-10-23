@@ -46,6 +46,71 @@ def assert_tree_equal(test, a, b):
 
 
 class GraceTests(unittest.TestCase):
+    def test_mixed_distillation_gate_pairing_and_stopped_gradients(self):
+        key = jax.random.PRNGKey(31)
+        obs = jnp.arange(24, dtype=jnp.float32).reshape(8, 3)
+        replay = jnp.arange(32, dtype=jnp.float32).reshape(8, 4) + 100.
+        data = dict(observations=obs, actions=replay)
+
+        class ActorNetwork:
+            def __init__(self, offset):
+                self.offset = offset
+
+            def select(self, name):
+                def distribution(observations):
+                    values = jnp.broadcast_to(observations[:, :1], (len(observations), 4))
+                    return SimpleNamespace(sample=lambda seed: values + self.offset)
+                return distribution
+
+        class QNetwork:
+            def __init__(self, scale):
+                self.scale = scale
+
+            def select(self, name):
+                return lambda observations, actions, params=None: (
+                    self.scale * actions.sum(axis=-1) + observations[:, 0])[None]
+
+        def evaluate(no_tanh, layer_norm, offset=20., teacher_scale=2., inputs=data):
+            captured = {}
+            def decode(observations, noises, noises_constrained):
+                captured['noises'] = noises
+                return noises
+            dummy = SimpleNamespace(
+                config=dict(use_no_tanh=no_tanh, use_layer_norm=layer_norm),
+                actor_network=ActorNetwork(offset), critic_network=QNetwork(1.),
+                action_critic_network=QNetwork(teacher_scale),
+                constrain_encoder_output=lambda x: x, constrain_actor_output=lambda x: x,
+                noise_to_actions_public=decode, _aggregate_q=lambda q: q.mean(axis=0))
+            loss, info = GRACEAgent.critic_loss(dummy, inputs, None, key)
+            return loss, info, captured['noises']
+
+        gaussian = jax.random.normal(key, replay.shape)
+        for no_tanh, layer_norm in ((False, False), (True, False), (False, True)):
+            _, info, noises = evaluate(no_tanh, layer_norm)
+            np.testing.assert_array_equal(noises, gaussian)
+            self.assertNotIn('actor_distillation_q_gap', info)
+
+        loss, info, noises = evaluate(True, True)
+        compiled_loss = jax.jit(lambda: evaluate(True, True)[0])()
+        np.testing.assert_allclose(compiled_loss, loss, rtol=1e-6)
+        indices = np.asarray(jax.random.permutation(jax.random.fold_in(key, 1), 8))
+        replay_rows, actor_rows, prior_rows = indices[:2], indices[2:4], indices[4:]
+        self.assertEqual(noises.shape, replay.shape)
+        np.testing.assert_array_equal(noises[replay_rows], replay[replay_rows])
+        np.testing.assert_array_equal(noises[prior_rows], gaussian[prior_rows])
+        np.testing.assert_array_equal(noises[actor_rows],
+                                      np.broadcast_to(np.asarray(obs[actor_rows, :1]) + 20., (2, 4)))
+        np.testing.assert_allclose(loss, jnp.mean(noises.sum(axis=-1) ** 2))
+        gap = -noises[actor_rows].sum(axis=-1)
+        np.testing.assert_allclose(info['actor_distillation_q_gap'], gap.mean())
+        np.testing.assert_allclose(info['actor_distillation_q_abs_gap'], jnp.abs(gap).mean())
+        self.assertEqual(int(info['actor_distillation_count']), 2)
+        self.assertEqual(float(jax.grad(lambda x: evaluate(True, True, offset=x)[0])(20.)), 0.)
+        self.assertEqual(float(jax.grad(lambda x: evaluate(True, True, teacher_scale=x)[0])(2.)), 0.)
+        replay_grad = jax.grad(lambda x: evaluate(
+            True, True, inputs=dict(data, actions=x))[0])(replay)
+        np.testing.assert_array_equal(replay_grad, jnp.zeros_like(replay))
+
     def test_inverse_direction_and_branching(self):
         class ConstantFlow:
             def select(self, name):
@@ -346,7 +411,8 @@ class GraceTests(unittest.TestCase):
 
     def test_encoder_sphere_disabled_preserves_original_policy(self):
         dsrl, baseline = make_pair()
-        config = dict(baseline.config, encoder_sphere_limit=False)
+        # This legacy equivalence check explicitly requires the tanh actor.
+        config = dict(baseline.config, encoder_sphere_limit=False, use_no_tanh=False)
         grace = GRACEAgent.create(1, jnp.zeros(3), jnp.zeros(2), config)
         observations = jax.random.normal(jax.random.PRNGKey(33), (128, 3))
         key = jax.random.PRNGKey(34)

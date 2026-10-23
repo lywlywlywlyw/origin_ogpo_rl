@@ -36,7 +36,8 @@ class GRACEAgent(flax.struct.PyTreeNode):
     unsquashed, tanh-bounded, hard-clipped, or projected onto the LPS sphere of radius sqrt(noise_dim).
     The frozen flow maps the resulting latent to actions.
     The action critic learns chunk returns via TD. The latent critic regresses
-    onto its values at actions decoded from the configured latent prior.
+    onto its values at decoded latents. With both use_no_tanh and
+    use_layer_norm, distillation mixes prior, replay, and actor latents.
     """
 
     rng: Any
@@ -50,6 +51,23 @@ class GRACEAgent(flax.struct.PyTreeNode):
         # Use the same latent prior as the decoder, including sphere projection.
         noises = jax.random.normal(rng, batch['actions'].shape, dtype=batch['actions'].dtype)
         noises = self.constrain_encoder_output(noises)
+        mixed = (self.config.get('use_no_tanh', False)
+                 and self.config.get('use_layer_norm', False))
+        # Preserve state/latent pairing and the original batch size. Each quarter
+        # rounds down; any remainder stays Gaussian (B=256 gives 128/64/64).
+        quarter = batch['actions'].shape[0] // 4
+        if mixed and quarter:
+            indices = jax.random.permutation(jax.random.fold_in(rng, 1), noises.shape[0])
+            replay_indices = indices[:quarter]
+            actor_indices = indices[quarter:2 * quarter]
+            dist = self.actor_network.select('actor')(batch['observations'][actor_indices])
+            actor_noises = self.constrain_actor_output(
+                dist.sample(seed=jax.random.fold_in(rng, 2)))
+            noises = noises.at[replay_indices].set(batch['actions'][replay_indices])
+            noises = noises.at[actor_indices].set(actor_noises)
+            # This optimizer step trains only Qz, including when differentiating
+            # the loss through the agent's actor/replay inputs for diagnostics.
+            noises = jax.lax.stop_gradient(noises)
         actions = self.noise_to_actions_public(
             batch['observations'], noises, noises_constrained=True)
         target_q = jax.lax.stop_gradient(self._aggregate_q(
@@ -58,13 +76,23 @@ class GRACEAgent(flax.struct.PyTreeNode):
         q = self.critic_network.select('critic')(
             batch['observations'], actions=noises, params=grad_params)
         critic_loss = jnp.mean(jnp.square(q - target_q))
-        return critic_loss, {
+        info = {
             'critic_loss': critic_loss,
             'distillation_loss': critic_loss,
             'q_mean': q.mean(), 'q_max': q.max(), 'q_min': q.min(),
             'target_q_mean': target_q.mean(),
             'noise_mean': noises.mean(), 'noise_std': noises.std(),
         }
+        if mixed:
+            # Reuse the exact actor rows evaluated above; no extra decoder batch.
+            gap = (self._aggregate_q(q)[actor_indices] - target_q[actor_indices]
+                   if quarter else jnp.zeros((1,), dtype=q.dtype))
+            info.update(
+                actor_distillation_q_gap=gap.mean(),
+                actor_distillation_q_abs_gap=jnp.abs(gap).mean(),
+                actor_distillation_count=jnp.asarray(quarter),
+            )
+        return critic_loss, info
 
     def _aggregate_q(self, qs):
         # SERL uses all ensemble members for the actor and online-Q values.
