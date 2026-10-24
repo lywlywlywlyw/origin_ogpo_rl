@@ -245,7 +245,7 @@ class CheckpointAndUpdateTests(unittest.TestCase):
 
 
 class RunnerTests(unittest.TestCase):
-    def test_warmup_probes_relabeling_terminals_and_actual_update_budgets(self):
+    def test_offline_probes_actor_warmup_and_actual_update_budgets(self):
         class Env:
             total = 0
             seeds = []
@@ -260,8 +260,10 @@ class RunnerTests(unittest.TestCase):
                 terminated = self.steps == 5
                 return np.full(23, self.steps / 10.), -1., terminated, False, {'success': float(terminated)}
         class Dataset:
-            def sample(self, _):
-                return dict(observations=np.zeros(23), actions=np.zeros(7))
+            size = 8
+            def sample(self, shape, idxs=None):
+                return dict(observations=np.zeros((*(() if shape == () else (shape,)), 23)),
+                            actions=np.zeros((*(() if shape == () else (shape,)), 7)))
         class Logger:
             def __init__(self):
                 self.records = []
@@ -281,16 +283,21 @@ class RunnerTests(unittest.TestCase):
                 buffer_size=100, seed=1)
             metadata = json.loads((Path(directory) / 'pss_subspace.json').read_text())
             self.assertEqual(metadata['decoder_queries'], 2 * (28 + 1))
+            self.assertEqual(metadata['probe_source'], 'offline dataset before online collection')
             self.assertTrue((Path(directory) / 'params_90047.pkl').exists())
         self.assertEqual(env.total, 47)
         self.assertEqual(step, 90047)
         budget = [record for prefix, record, _ in logger.records if prefix == 'online_budget'][-1]
-        self.assertEqual(budget['gradient_updates'], 28)
-        self.assertEqual(budget['critic_gradient_updates'], 56)
-        self.assertEqual(budget['noise_critic_gradient_updates'], 280)
-        self.assertEqual(int(updated.actor_network.step) - int(agent.actor_network.step), 28)
-        self.assertEqual(int(updated.critic_network.step) - int(agent.critic_network.step), 56)
-        self.assertEqual(int(updated.noise_critic_network.step) - int(agent.noise_critic_network.step), 280)
+        self.assertEqual(budget['probe_env_steps'], 0)
+        self.assertEqual(budget['gradient_updates'], 27)
+        self.assertEqual(budget['critic_gradient_updates'], 54)
+        self.assertEqual(budget['noise_critic_gradient_updates'], 270)
+        self.assertEqual(int(updated.actor_network.step) - int(agent.actor_network.step), 27)
+        self.assertEqual(int(updated.critic_network.step) - int(agent.critic_network.step), 54)
+        self.assertEqual(int(updated.noise_critic_network.step) - int(agent.noise_critic_network.step), 270)
+        _, actor_key, _ = jax.random.split(jax.random.PRNGKey(40001), 3)
+        initial = agent.replace(steering_basis=updated.steering_basis, basis_ready=jnp.asarray(True))
+        np.testing.assert_allclose(replay['actions'][0], initial.sample_noise(np.zeros(23), actor_key))
         np.testing.assert_allclose(replay['actions'][:replay.size],
             replay['initial_noise'][:replay.size] @ np.asarray(updated.steering_basis[:, :2]), atol=1e-6)
         self.assertIn(1, replay['chunk_length'][:replay.size])

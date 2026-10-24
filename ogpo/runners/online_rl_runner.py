@@ -163,12 +163,25 @@ def _sample_success_batch(replay_buffer, success_buffer_batch_size, utd_ratio,
     return batch, True
 
 
+def _rollout_actor_method(agent, config, best_of_n):
+    """Choose the same policy for replay warmup and subsequent online collection."""
+    if config.get('use_one_step_for_rollouts', False):
+        if best_of_n > 1 and hasattr(agent, 'sample_actions_one_step_BON'):
+            return 'sample_actions_one_step_BON'
+        if hasattr(agent, 'sample_actions_one_step'):
+            return 'sample_actions_one_step'
+        return 'sample_actions'
+    if best_of_n > 1 and hasattr(agent, 'sample_actions_BON'):
+        return 'sample_actions_BON'
+    return 'sample_actions'
+
+
 def _q_warmup_collect(
     agent, env, replay_buffer, *,
     q_warmup_steps, action_dim, has_images, discount, seed,
-    use_success_buffer, mc_regression, encode_fn, coverage=None,
+    use_success_buffer, mc_regression, encode_fn, coverage=None, best_of_n=1,
 ):
-    """Phase A of phase-split q_warmup: env collection with the base actor (no BoN).
+    """Phase A of phase-split q_warmup: env collection with the configured online policy.
 
     Runs `q_warmup_steps` env steps; the final incomplete episode is discarded so
     the buffer only holds fully-bootstrapped trajectories.
@@ -182,7 +195,8 @@ def _q_warmup_collect(
     if encode_fn is not None and ob_images is not None:
         ob = np.asarray(encode_fn(_state_for_encoder(ob, ob_full_state, _use_full_state)[None], ob_images[None])[0])
         ob_images = None
-    _qwarmup_actor_supported = _actor_supported_kwargs(agent.sample_actions)
+    actor = getattr(agent, _rollout_actor_method(agent, agent.config, best_of_n))
+    _qwarmup_actor_supported = _actor_supported_kwargs(actor)
     trajectory_buffer = []
     action_queue = []
 
@@ -195,7 +209,7 @@ def _q_warmup_collect(
             if ob_full_state is not None:
                 actor_kwargs['full_state'] = ob_full_state
             actor_kwargs = _filter_actor_kwargs(actor_kwargs, _qwarmup_actor_supported)
-            action = agent.sample_actions(**actor_kwargs)
+            action = actor(**actor_kwargs)
             for a in np.array(action).reshape(-1, action_dim):
                 action_queue.append(a)
         action = action_queue.pop(0)
@@ -472,7 +486,7 @@ def run_online_rl(
             q_warmup_steps=q_warmup_steps, action_dim=action_dim,
             has_images=has_images, discount=discount, seed=seed,
             use_success_buffer=use_success_buffer, mc_regression=mc_regression,
-            encode_fn=encode_fn, coverage=coverage,
+            encode_fn=encode_fn, coverage=coverage, best_of_n=best_of_n,
         )
         agent, log_step = _q_warmup_train(
             agent=agent, replay_buffer=replay_buffer, train_dataset=train_dataset,
@@ -500,20 +514,8 @@ def run_online_rl(
     q_warmup_end = start_training + bc_refine_steps + q_warmup_steps
     eval_start = q_warmup_end if has_phases else start_training
 
-    # Select the policy used for online rollouts
-    if config.get('use_one_step_for_rollouts', False):
-        if best_of_n > 1 and hasattr(agent, 'sample_actions_one_step_BON'):
-            _actor_method_name = 'sample_actions_one_step_BON'
-            print(f"Using one-step BON policy (N={best_of_n}) for online rollouts")
-        elif hasattr(agent, 'sample_actions_one_step'):
-            _actor_method_name = 'sample_actions_one_step'
-            print("Using one-step policy for online rollouts")
-        else:
-            _actor_method_name = 'sample_actions'
-    elif best_of_n > 1 and hasattr(agent, 'sample_actions_BON'):
-        _actor_method_name = 'sample_actions_BON'
-    else:
-        _actor_method_name = 'sample_actions'
+    _actor_method_name = _rollout_actor_method(agent, config, best_of_n)
+    print(f"Using {_actor_method_name} from the first online interaction")
 
     _rollout_actor_supported = _actor_supported_kwargs(getattr(agent, _actor_method_name))
 
@@ -620,7 +622,7 @@ def run_online_rl(
         if coverage is not None and log_interval > 0 and i % log_interval == 0:
             logger.log(coverage.metrics(), 'action_coverage', step=log_step)
 
-        if i < start_training:
+        if i <= start_training:
             continue
 
         is_warmup = has_phases and (i < bc_refine_steps or i < q_warmup_end)

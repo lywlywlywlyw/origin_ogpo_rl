@@ -43,7 +43,7 @@ clip_grad_norm=1.0
 utd_warmup=1
 utd_online=4
 offline_ratio=0.0
-start_training=40000
+start_training=10000
 
 # Evaluation
 n_eval_envs=32

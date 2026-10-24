@@ -37,7 +37,7 @@ No offline training or automatic process resume occurs.
    the current observation and in the replay transition's `next_anchors` for
    bootstrap states. True terminals do not need a next bank; time-limit
    truncations retain the final observation/bank and bootstrap normally.
-4. After 10,000 latent decisions, construct M=32 additional Gaussian particles
+4. From the first latent decision, construct M=32 additional Gaussian particles
    around each candidate, retaining the anchor itself. Adaptive reach probes a
    separate cloud at sigma_max=0.3, computes the median head standard deviation
    over all probe particles/candidates, and sets sigma=0.05+0.25*clip(u,0,1).
@@ -52,7 +52,7 @@ No offline training or automatic process resume occurs.
    fresh particles/defer draws, as in the paper. Q-learning uses fresh refinements
    of cached next-state banks, online-Q selection, and target-Q evaluation.
 
-The particle and exploration schedules count decisions; the inherited training
+The exploration schedule counts decisions; the inherited training
 and evaluation budgets count physical environment steps.
 
 ## Comparison settings
@@ -69,7 +69,7 @@ distillation critics are method-specific and are not added to AnchorQ.
 Two critic updates run per eligible physical step, including the same extra
 successful-trajectory Q update when a successful batch is available; otherwise
 the extra update uses ordinary replay. `online_budget` records actual optimizer
-steps and zero actor/decoder updates. The expected critic budget is 3,980,002
+steps and zero actor/decoder updates. The expected critic budget is 3,980,000
 steps. Matching critic steps does not match total compute: AnchorQ evaluates many
 candidates, while SAC baselines also update an actor. Candidate Q queries are
 processed in bounded batches to limit activation memory.

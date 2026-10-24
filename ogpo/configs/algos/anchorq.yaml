@@ -10,8 +10,6 @@ agent:
   # M ADDITIONAL particles; each cloud also contains the unperturbed anchor.
   anchorq_particle_count: 32
   anchorq_particle_sigma: 0.5
-  anchorq_particle_warmup_decisions: 10000
-  anchorq_sigma_ramp_decisions: 0
   anchorq_adaptive_sigma: true
   anchorq_sigma_min: 0.05
   anchorq_sigma_max: 0.3

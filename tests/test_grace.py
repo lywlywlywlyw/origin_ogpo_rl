@@ -215,7 +215,7 @@ class GraceTests(unittest.TestCase):
         loss, _ = agent.action_critic_loss(data, agent.action_critic_network.params, key)
         np.testing.assert_allclose(loss, jnp.mean((predicted-target) ** 2), atol=1e-6)
 
-        # The clip switch belongs to the encoder, not Gaussian warmup/distillation.
+        # The clip switch belongs to the encoder, not the Gaussian distillation prior.
         prior = jax.random.normal(key, data['actions'].shape)
         _, prior_info = agent.critic_loss(data, agent.critic_network.params, key)
         np.testing.assert_allclose(prior_info['noise_std'], prior.std(), atol=1e-6)
@@ -534,7 +534,7 @@ class GraceTests(unittest.TestCase):
         position = 0
         for index in range(replay.size):
             online_rng, latent_rng = jax.random.split(online_rng)
-            z = grace.constrain_encoder_output(jax.random.normal(latent_rng, (8,)))
+            z = grace.sample_noise(jnp.zeros(3), rng=latent_rng)
             clean = grace.noise_to_actions_public(jnp.zeros(3), z)
             online_rng, noise_rng = jax.random.split(online_rng)
             expected = grace.add_decoder_noise(clean, noise_rng)
@@ -691,6 +691,7 @@ class GraceTests(unittest.TestCase):
             def sample_actions(self, **kwargs):
                 return np.zeros(4)
             def batch_update(self, batch, *args):
+                assert env.total > 20, 'Updated during collection-only warmup'
                 count = batch['actions'].shape[0]
                 values = np.arange(self.updates+1, self.updates+count+1)
                 self.updates += count
@@ -711,16 +712,16 @@ class GraceTests(unittest.TestCase):
                 eval_interval=10, log_interval=10, save_interval=-1,
                 force_jax_sync=False, buffer_size=100, start_step=90000)
         self.assertEqual(step, 90047)
-        self.assertEqual(agent.updates, 28)
+        self.assertEqual(agent.updates, 27)
         metrics = [v for k,v,_ in logger.records if k == 'online_agent']
-        self.assertEqual(len(metrics), 3)
-        self.assertEqual([v['actor/actor_loss'] for v in metrics], [1., 11., 21.])
-        self.assertEqual([v['sensitivity/ratio'] for v in metrics], [1., 11., 21.])
+        self.assertEqual(len(metrics), 2)
+        self.assertEqual([v['actor/actor_loss'] for v in metrics], [10., 20.])
+        self.assertEqual([v['sensitivity/ratio'] for v in metrics], [10., 20.])
         self.assertEqual([step for k, _, step in logger.records if k == 'online_agent'],
-                         [90020, 90030, 90040])
+                         [90030, 90040])
         self.assertIn('true_actions', replay)
         budget = [v for k,v,_ in logger.records if k == 'online_budget'][-1]
-        self.assertEqual(budget['critic_gradient_updates'], 56)
+        self.assertEqual(budget['critic_gradient_updates'], 54)
 
 
 if __name__ == '__main__':

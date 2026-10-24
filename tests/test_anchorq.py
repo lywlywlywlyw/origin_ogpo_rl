@@ -87,7 +87,7 @@ class AnchorQTests(unittest.TestCase):
         # Discrete reverse integration evaluates decreasing t; it is not forward flow.
         np.testing.assert_allclose(agent.reverse_flow_actions(obs[0], actions[0]), latent[0])
 
-    def test_shapes_warmup_and_fresh_defer(self):
+    def test_refinement_from_first_decision_and_fresh_defer(self):
         agent = make_agent(anchorq_particle_warmup_decisions=10)
         obs = jnp.zeros((2, 23))
         bank = agent.build_anchor_bank(obs, jax.random.PRNGKey(1))
@@ -95,9 +95,10 @@ class AnchorQTests(unittest.TestCase):
         self.assertEqual(bank.shape, (2, 7, 28))
         np.testing.assert_allclose(bank[:, :6], other[:, :6])
         self.assertFalse(np.array_equal(bank[:, -1], other[:, -1]))
-        np.testing.assert_array_equal(agent.refine_anchors(obs, bank, jax.random.PRNGKey(3)), bank)
+        first = agent.refine_anchors(obs, bank, jax.random.PRNGKey(3))
         active = agent.replace(decision_step=jnp.asarray(10))
         refined = active.refine_anchors(obs, bank, jax.random.PRNGKey(3))
+        np.testing.assert_array_equal(first, refined)
         self.assertTrue(np.isfinite(refined).all())
         self.assertGreater(float(jnp.linalg.norm(refined - bank)), 0.)
         selected, _ = active.select_latent(obs, bank, jax.random.PRNGKey(4))
@@ -260,9 +261,9 @@ class AnchorQTests(unittest.TestCase):
                 buffer_size=100, start_step=90000)
         self.assertEqual(env.total, 47)
         self.assertEqual(step, 90047)
-        self.assertEqual(int(result.critic_network.step) - int(agent.critic_network.step), 2 * (47 - 20 + 1))
+        self.assertEqual(int(result.critic_network.step) - int(agent.critic_network.step), 2 * (47 - 20))
         budget = [data for prefix, data in logger.rows if prefix == 'online_budget'][-1]
-        self.assertEqual(budget['critic_gradient_updates'], 56)
+        self.assertEqual(budget['critic_gradient_updates'], 54)
         self.assertEqual(budget['actor_gradient_updates'], 0)
         self.assertLess(budget['anchor_bank_constructions'], 2 * budget['decisions'])
         size = replay.size

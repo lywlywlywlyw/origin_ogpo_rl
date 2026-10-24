@@ -29,6 +29,7 @@ training:
 
 buffer:
   size: 2000000
+  # Collect with the online policy from step 1; update only after these env steps.
   start_training: 10000
   utd_warmup: 1
   utd_online: 1

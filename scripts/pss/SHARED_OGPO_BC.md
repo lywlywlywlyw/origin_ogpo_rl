@@ -20,8 +20,8 @@ nohup env ROBOMIMIC_DATASET_ROOT=/root/datasets MUJOCO_GL=egl \
    `exp/ogpo/OGPO/square/square-mh-low_dim/ogpo_squareseed1/params_90000.pkl`.
    Its architecture and parameters are unchanged; actor/critic/temperature are
    initialized fresh. The loader also accepts a DSRL checkpoint's frozen decoder.
-2. Collect 64 observations spread across the existing Gaussian-policy warmup.
-   These interactions count toward the online budget and supply ordinary replay.
+2. Sample 64 offline observations before online collection to fit the fixed basis.
+   No extra environment interactions or optimizer updates are used.
    Independently sample one Gaussian base noise per observation.
 3. Compute forward differences with delta=0.05 of normalized, output-clipped
    chunks. Form the **uncentered** mean R R^T (Eq. 4), then its descending
@@ -48,9 +48,9 @@ interface. In particular:
 | Quantity | Matched PSS / existing matched DSRL |
 | --- | --- |
 | Offline decoder | Same OGPO 90,000-step snapshot |
-| New physical interactions | 2,000,000, including probe-state warmup |
-| First update | Interaction 10,000 inclusive |
-| Actor / critic updates | 1,990,001 / 3,980,002 |
+| New physical interactions | 2,000,000, including actor-policy collection warmup |
+| First update | After the first 10,000 interactions (at the next chunk boundary) |
+| Actor / critic updates | 1,990,000 / 3,980,000 |
 | Batch / horizon / physical-step discount | 256 / 4 / 0.99 |
 | Critic ensemble / aggregation / tau | 10 / mean / 0.05 |
 | Critic optimizer | AdamW, 4.5e-5, weight decay 1e-5 |

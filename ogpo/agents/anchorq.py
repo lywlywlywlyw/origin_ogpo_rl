@@ -156,32 +156,26 @@ class AnchorQAgent(flax.struct.PyTreeNode):
         count = self.config['anchorq_particle_count']
         if count == 0:
             return anchors
+        # Refinement is part of the policy from the first decision. Legacy
+        # particle warmup/ramp config keys are accepted but no longer applied.
         probe_rng, refine_rng = jax.random.split(rng)
 
-        def refine(_):
-            if self.config['anchorq_adaptive_sigma']:
-                sigma_max = jnp.full(batch_shape, self.config['anchorq_sigma_max'])
-                probes = self._particle_cloud(anchors, probe_rng, sigma_max)
-                probe_values = self._candidate_qs(observations, probes)
-                uncertainty = jnp.median(jnp.std(probe_values, axis=0), axis=(-2, -1))
-                sigma = (self.config['anchorq_sigma_min']
-                         + (self.config['anchorq_sigma_max'] - self.config['anchorq_sigma_min'])
-                         * jnp.clip(uncertainty, 0., 1.))
-            else:
-                ramp = self.config['anchorq_sigma_ramp_decisions']
-                scale = (jnp.clip((self.decision_step - self.config['anchorq_particle_warmup_decisions'])
-                                  / max(1, ramp), 0., 1.) if ramp else 1.)
-                sigma = jnp.full(batch_shape, self.config['anchorq_particle_sigma'] * scale)
-            particles = self._particle_cloud(anchors, refine_rng, sigma)
-            values = self._candidate_qs(observations, particles)
-            refined, _, _ = value_tilted_barycenters(
-                particles, values, self.config['anchorq_tilt_beta'],
-                self.config['anchorq_adaptive_beta'], self.config['anchorq_uncertainty_floor'])
-            return refined
-
-        return jax.lax.cond(
-            self.decision_step >= self.config['anchorq_particle_warmup_decisions'],
-            refine, lambda _: anchors, operand=None)
+        if self.config['anchorq_adaptive_sigma']:
+            sigma_max = jnp.full(batch_shape, self.config['anchorq_sigma_max'])
+            probes = self._particle_cloud(anchors, probe_rng, sigma_max)
+            probe_values = self._candidate_qs(observations, probes)
+            uncertainty = jnp.median(jnp.std(probe_values, axis=0), axis=(-2, -1))
+            sigma = (self.config['anchorq_sigma_min']
+                     + (self.config['anchorq_sigma_max'] - self.config['anchorq_sigma_min'])
+                     * jnp.clip(uncertainty, 0., 1.))
+        else:
+            sigma = jnp.full(batch_shape, self.config['anchorq_particle_sigma'])
+        particles = self._particle_cloud(anchors, refine_rng, sigma)
+        values = self._candidate_qs(observations, particles)
+        refined, _, _ = value_tilted_barycenters(
+            particles, values, self.config['anchorq_tilt_beta'],
+            self.config['anchorq_adaptive_beta'], self.config['anchorq_uncertainty_floor'])
+        return refined
 
     @jax.jit
     def select_latent(self, observations, anchors, rng, epsilon=0.):
@@ -283,7 +277,7 @@ class AnchorQAgent(flax.struct.PyTreeNode):
         defaults = dict(
             anchorq_reference_magnitude=1., anchorq_reference_gripper=0.,
             anchorq_include_defer=True, anchorq_particle_count=32,
-            anchorq_particle_sigma=0.5, anchorq_particle_warmup_decisions=10000,
+            anchorq_particle_sigma=0.5, anchorq_particle_warmup_decisions=0,
             anchorq_sigma_ramp_decisions=0, anchorq_adaptive_sigma=True,
             anchorq_sigma_min=0.05, anchorq_sigma_max=0.3,
             anchorq_tilt_beta=1., anchorq_adaptive_beta=True,

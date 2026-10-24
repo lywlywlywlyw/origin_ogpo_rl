@@ -240,28 +240,19 @@ def _run_jgcw_online_rl(
             online_rng, key = jax.random.split(online_rng)
 
             if len(action_queue) == 0:
-                if total_env_step >= start_training:
-                    if is_dsrl_expo:
-                        online_rng, action_key = jax.random.split(online_rng)
-                        action_info = agent.sample_actions(
-                            observations=ob, rng=action_key,
-                            deterministic=False, return_info=True)
-                        action = action_info['actions']
-                        current_noise = np.array(action_info['noise']).flatten()
-                        current_base_actions = np.array(action_info['base_actions']).flatten()
-                    else:
-                        noise = agent.sample_noise(observations=ob, rng=key)
-                        current_noise = np.array(noise).flatten()
-                        action = agent.noise_to_actions_public(ob, noise)
+                # Warmup delays learning, never bypasses the online policy.
+                if is_dsrl_expo:
+                    online_rng, action_key = jax.random.split(online_rng)
+                    action_info = agent.sample_actions(
+                        observations=ob, rng=action_key,
+                        deterministic=False, return_info=True)
+                    action = action_info['actions']
+                    current_noise = np.array(action_info['noise']).flatten()
+                    current_base_actions = np.array(action_info['base_actions']).flatten()
                 else:
-                    noise = jax.random.normal(key, (noise_dim,))
+                    noise = agent.sample_noise(observations=ob, rng=key)
                     current_noise = np.array(noise).flatten()
-                    if is_dsrl_expo:
-                        base_actions = agent.noise_to_actions_public(ob, noise)
-                        action = base_actions
-                        current_base_actions = np.array(base_actions).flatten()
-                    else:
-                        action = agent.noise_to_actions_public(ob, noise)
+                    action = agent.noise_to_actions_public(ob, noise)
 
                 current_true_actions = np.array(action).flatten()
                 action_chunk = np.array(action).reshape(-1, action_dim)
@@ -350,12 +341,12 @@ def _run_jgcw_online_rl(
                     total_env_step // log_interval > previous_env_step // log_interval):
                 logger.log(coverage.metrics(), 'action_coverage', step=log_step)
 
-            if total_env_step < start_training:
+            if total_env_step <= start_training:
                 continue
 
             # OGPO does UTD updates at each eligible *physical* env step.
             # A chunk crossing start_training contributes only its eligible steps.
-            eligible_steps = max(0, total_env_step - max(previous_env_step, start_training - 1))
+            eligible_steps = max(0, total_env_step - max(previous_env_step, start_training))
             utd_ratio = utd_online * eligible_steps if per_env_updates else utd_online
             if utd_ratio == 0:
                 continue
@@ -448,7 +439,7 @@ def _run_jgcw_online_rl(
                     wandb_run_id=wandb_run_id, algo_name=algo_name)
 
     if per_env_updates and not is_resumed:
-        expected = max(0, online_steps - max(1, start_training) + 1) * utd_online
+        expected = max(0, online_steps - max(0, start_training)) * utd_online
         if gradient_updates != expected:
             raise RuntimeError(f'Actor update budget mismatch: {gradient_updates} != {expected}')
         if config.get('critic_updates_per_actor', 1) == 2 and critic_gradient_updates != 2 * expected:

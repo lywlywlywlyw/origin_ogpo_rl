@@ -254,14 +254,14 @@ def run_anchorq_online_rl(
                 observation, anchors = next_observation, next_anchors
 
             logger.log(dict(total_env_steps=steps, epsilon=float(epsilon),
-                            particle_active=float(decisions > agent.config['anchorq_particle_warmup_decisions']),
+                            particle_active=float(agent.config['anchorq_particle_count'] > 0),
                             latent_rms=float(np.sqrt(np.mean(np.asarray(latent) ** 2))),
                             decoded_gripper_abs=float(np.abs(decoded.reshape(horizon_length, action_dim)[:, -1]).mean()),
                             successful_replay_chunks=int(replay._traj_success_mask[:replay.size].sum()),
                             **{k: float(v) for k, v in selection_info.items()}), 'env', step=log_step)
-            if steps < start_training:
+            if steps <= start_training:
                 continue
-            eligible = max(0, steps - max(previous, start_training - 1))
+            eligible = max(0, steps - max(previous, start_training))
             utd = utd_online * eligible if per_step else utd_online
             if utd == 0:
                 continue
@@ -331,7 +331,7 @@ def run_anchorq_online_rl(
             if log_enabled and save_interval > 0 and steps // save_interval > previous // save_interval:
                 save_agent(agent, save_dir, log_step)
 
-    expected = max(0, online_steps - max(1, start_training) + 1) * utd_online
+    expected = max(0, online_steps - max(0, start_training)) * utd_online
     if per_step and updates != expected:
         raise RuntimeError(f'AnchorQ physical-step update budget mismatch: {updates} != {expected}')
     if int(agent.critic_network.step) - initial_critic_step != critic_updates:

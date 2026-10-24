@@ -366,12 +366,8 @@ def run_grace_online_rl(
             online_rng, key = jax.random.split(online_rng)
 
             if len(action_queue) == 0:
-                if total_env_step >= start_training:
-                    noise = agent.sample_noise(observations=ob, rng=key)
-                else:
-                    noise = jax.random.normal(key, (noise_dim,))
-                    if config.get('encoder_sphere_limit', False):
-                        noise = agent.constrain_encoder_output(noise)
+                # Use the same constrained latent actor from the first interaction.
+                noise = agent.sample_noise(observations=ob, rng=key)
                 current_noise = np.array(noise).flatten()
                 if config.get('encoder_sphere_limit', False):
                     action = agent.noise_to_actions_public(ob, noise, noises_constrained=True)
@@ -456,12 +452,12 @@ def run_grace_online_rl(
             else:
                 ob = next_ob
 
-            if total_env_step < start_training:
+            if total_env_step <= start_training:
                 continue
 
             # OGPO does UTD updates at each eligible *physical* env step.
             # A chunk crossing start_training contributes only its eligible steps.
-            eligible_steps = max(0, total_env_step - max(previous_env_step, start_training - 1))
+            eligible_steps = max(0, total_env_step - max(previous_env_step, start_training))
             utd_ratio = utd_online * eligible_steps if per_env_updates else utd_online
             if utd_ratio == 0:
                 continue
@@ -555,7 +551,7 @@ def run_grace_online_rl(
                     wandb_run_id=wandb_run_id, algo_name=algo_name)
 
     if per_env_updates and not is_resumed:
-        expected = max(0, online_steps - max(1, start_training) + 1) * utd_online
+        expected = max(0, online_steps - max(0, start_training)) * utd_online
         if gradient_updates != expected:
             raise RuntimeError(f'Actor update budget mismatch: {gradient_updates} != {expected}')
         if config.get('critic_updates_per_actor', 1) == 2 and critic_gradient_updates != 2 * expected:

@@ -126,6 +126,7 @@ class BudgetTests(unittest.TestCase):
             def sample_actions(self, **kwargs):
                 return np.zeros(4)
             def batch_update(self, batch, *args):
+                assert env.total > 20, 'Updated during collection-only warmup'
                 self.updates += batch['actions'].shape[0]
                 return self, {'loss': 0.}
         class Logger:
@@ -143,9 +144,10 @@ class BudgetTests(unittest.TestCase):
                 batch_size=1, horizon_length=4, discount=.99, utd_online=1,
                 n_eval_envs=1, eval_interval=10, log_interval=10,
                 save_interval=-1, force_jax_sync=False, buffer_size=100, start_step=90000)
+        np.testing.assert_array_equal(buffer["actions"][:buffer.size], 0.)
         self.assertEqual(env.total, 47)
         self.assertEqual(step, 90047)
-        self.assertEqual(agent.updates, 47 - 20 + 1)
+        self.assertEqual(agent.updates, 47 - 20)
         budget = [v for k, v, _ in logger.records if k == 'online_budget'][-1]
         self.assertEqual(budget['gradient_updates'], agent.updates)
         self.assertEqual(budget['env_steps'], 47)

@@ -112,7 +112,7 @@ def test_runner_builds_demo_before_online_and_mixes_every_utd_batch():
             buffer_size=100, force_jax_sync=False, save_interval=-1,
             log_interval=-1, eval_interval=-1)
     assert events[0] == 'inverse' and batches
-    assert sum(b['observations'].shape[0] for b in batches) == 56
+    assert sum(b['observations'].shape[0] for b in batches) == (127 - 100) * 2
     for b in batches:
         assert b['observations'].shape[1] == 4
         assert np.all(b['observations'][:, :2] >= 1000.)

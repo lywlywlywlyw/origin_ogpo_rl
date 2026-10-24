@@ -1,9 +1,9 @@
 """PSS online collection, fixed response probing, and matched-budget SAC.
 
-The N probe states come from the existing Gaussian-policy warmup, not extra
-rollouts. Replay stores z (not the full noise or decoded action) as the SAC
-action. Decoded action chunks train the action critic. Full initial noise is retained
-only for warmup relabeling and diagnostics.
+The fixed subspace is fitted from offline observations before collection.
+Every online query uses the latent actor and Gaussian orthogonal complement.
+Replay stores actor z as the SAC action, decoded chunks for the action critic,
+and full initial noise for diagnostics.
 """
 
 import hashlib
@@ -42,7 +42,7 @@ def _save_probe_artifacts(agent, diagnostics, observations, base_noises, save_di
         num_probes=len(observations), delta=agent.config['pss_delta'],
         decoder_queries=len(observations) * (agent.config['noise_dim'] + 1),
         retained_energy=diagnostics['retained_energy'],
-        probe_source='Gaussian warmup within the online interaction budget',
+        probe_source='offline dataset before online collection',
         reward_aggregation=agent.config['chunk_reward_aggregation'],
         updates_per_env_step=agent.config['updates_per_env_step'],
     )
@@ -86,7 +86,7 @@ def run_pss_online_rl(
     if not bool(agent.decoder_loaded):
         raise ValueError('PSS requires an explicitly restored offline BC flow checkpoint')
     if bool(agent.basis_ready):
-        raise ValueError('Fresh runs must probe the restored checkpoint during warmup')
+        raise ValueError('Fresh runs must probe the restored checkpoint before online collection')
     per_step = config.get('updates_per_env_step', True)
     aggregation = config.get('chunk_reward_aggregation', 'discounted_sum')
     if aggregation not in ('discounted_sum', 'query_sum'):
@@ -97,8 +97,8 @@ def run_pss_online_rl(
         raise ValueError('PSS requires equal actor/critic UTD; use critic_updates_per_actor')
     n_probes, k = agent.config['pss_num_probes'], agent.config['pss_dim']
     dim = agent.config['noise_dim']
-    if start_training <= n_probes * horizon_length or online_steps < start_training:
-        raise ValueError('Warmup must fit all PSS probes before the first SAC update')
+    if start_training < 0 or online_steps < 1:
+        raise ValueError('Require nonnegative warmup and positive online_steps')
     minimum_capacity = batch_size * utd_online * horizon_length if per_step else batch_size
     if batch_size <= 0 or utd_online < 1 or buffer_size < minimum_capacity:
         raise ValueError('Invalid batch/UTD or insufficient replay capacity')
@@ -137,12 +137,20 @@ def run_pss_online_rl(
                 ('observations', 'next_observations', 'actions', 'true_actions', 'rewards',
                  'masks', 'terminals', 'chunk_length')}
 
+    # Fit the frozen decoder's response basis without collecting from a different policy.
+    probe_rng = np.random.default_rng(seed + 50000)
+    probe_indices = probe_rng.choice(train_dataset.size, size=n_probes,
+                                     replace=train_dataset.size < n_probes)
+    probe_obs = np.asarray(train_dataset.sample(n_probes, idxs=probe_indices)['observations'])
+    base_noises = probe_rng.standard_normal((n_probes, dim)).astype(np.float32)
+    agent, diagnostics = agent.fit_subspace(probe_obs, base_noises)
+    _save_probe_artifacts(agent, diagnostics, probe_obs, base_noises, save_dir)
+    print(f'PSS: k={k}/{dim}, response energy={diagnostics["retained_energy"]:.4f}, '
+          'offline probes complete before online collection')
+
     raw, _ = env.reset(seed=seed + 10000)
     observation = encode(raw)
     online_rng = jax.random.PRNGKey(seed + 40000)
-    probe_rng = np.random.default_rng(seed + 50000)
-    probe_observations = []
-    probe_stride = max(1, (start_training - horizon_length) // n_probes)
     pending = []
     steps, episodes, actor_updates, critic_updates = 0, 0, 0, 0
     log_step, eval_info = start_step, {}
@@ -163,33 +171,10 @@ def run_pss_online_rl(
     with tqdm.tqdm(total=online_steps, desc='PSS Online RL', dynamic_ncols=True) as progress:
         while steps < online_steps:
             previous = steps
-            # Spread the fixed probe set across Gaussian-policy warmup episodes.
-            if not bool(agent.basis_ready) and steps >= len(probe_observations) * probe_stride:
-                probe_observations.append(observation.copy())
-                if len(probe_observations) == n_probes:
-                    probe_obs = np.stack(probe_observations)
-                    base_noises = probe_rng.standard_normal((n_probes, dim)).astype(np.float32)
-                    agent, diagnostics = agent.fit_subspace(probe_obs, base_noises)
-                    probe_env_steps = steps
-                    _save_probe_artifacts(agent, diagnostics, probe_obs, base_noises, save_dir)
-                    # Earlier warmup entries were recorded before V_k existed.
-                    basis = np.asarray(agent.steering_basis[:, :k])
-                    replay['actions'][:replay.size] = replay['initial_noise'][:replay.size] @ basis
-                    for item in pending:
-                        item['actions'] = item['initial_noise'] @ basis
-                    print(f'PSS: k={k}/{dim}, response energy={diagnostics["retained_energy"]:.4f}, '
-                          f'probes complete at physical step {steps}')
-
-            # Keep the next iteration's key independent of this query's draws.
+            # Keep the same policy and independent RNG streams throughout collection.
             online_rng, actor_key, complement_key = jax.random.split(online_rng, 3)
-            if steps < start_training:
-                full_noise = jax.random.normal(actor_key, (dim,))
-                z = (agent.project_noise(full_noise) if bool(agent.basis_ready)
-                     else np.zeros(k, np.float32))
-            else:
-                agent._require_basis()
-                z = agent.sample_noise(observation, actor_key)
-                full_noise = agent.reconstruct_noise(z, complement_key)
+            z = agent.sample_noise(observation, actor_key)
+            full_noise = agent.reconstruct_noise(z, complement_key)
             decoded = np.asarray(agent.compute_flow_actions(observation, noises=full_noise))
             rewards, terminated, done, info = [], False, False, {}
             for action in decoded.reshape(horizon_length, action_dim):
@@ -229,10 +214,10 @@ def run_pss_online_rl(
 
             env_info = {key: value for key, value in info.items() if key.startswith('distance')}
             logger.log(dict(env_info, total_env_steps=steps), 'env', step=log_step)
-            if steps < start_training:
+            if steps <= start_training:
                 continue
             agent._require_basis()
-            eligible = max(0, steps - max(previous, start_training - 1))
+            eligible = max(0, steps - max(previous, start_training))
             utd = utd_online * eligible if per_step else utd_online
             minimum_replay = batch_size * utd if per_step else batch_size
             if replay.size < minimum_replay:
@@ -281,7 +266,7 @@ def run_pss_online_rl(
     for item in pending:
         replay.add_transition(item)
     if per_step:
-        expected = max(0, online_steps - max(1, start_training) + 1) * utd_online
+        expected = max(0, online_steps - max(0, start_training)) * utd_online
         if actor_updates != expected:
             raise RuntimeError(f'Actor update budget mismatch: {actor_updates} != {expected}')
     if int(agent.actor_network.step) - initial_actor_step != actor_updates:

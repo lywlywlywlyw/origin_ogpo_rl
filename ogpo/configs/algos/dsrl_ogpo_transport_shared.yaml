@@ -25,7 +25,7 @@ training:
   gpu_mode: single
 buffer:
   size: 2000000
-  start_training: 40000
+  start_training: 10000
   utd_warmup: 1
   utd_online: 1
   utd_q: 1

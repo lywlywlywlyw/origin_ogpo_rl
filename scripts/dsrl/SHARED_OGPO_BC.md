@@ -21,15 +21,15 @@ at 2,090,000 so they line up with the saved OGPO run.
 | Offline flow weights | 90,000-step BC snapshot | Exact same snapshot, frozen online |
 | Environment/data settings | `square-mh-low_dim`, all trajectories, proportion 1 | Same recorded settings; offline ratio 0 online |
 | Physical training environment interactions | 2,000,000 | Exactly 2,000,000 |
-| Start learning | Interaction 10,000 inclusive | Same |
-| Online actor optimizer updates | 1,990,001 | Exactly 1,990,001 |
-| Online critic optimizer updates | 3,980,002 | Exactly 3,980,002 |
+| Start learning | Interaction 10,000 inclusive | After 10,000 collection-only interactions |
+| Online actor optimizer updates | 1,990,001 | 1,990,000 |
+| Online critic optimizer updates | 3,980,002 | 3,980,000 |
 | Batch size / action horizon / discount | 256 / 4 / .99 | Same |
 | Critic ensemble / aggregation / EMA tau | 10 / mean / .05 | Same |
 | Online critic optimizer | AdamW, constant 4.5e-5, weight decay 1e-5 | Same |
 | Evaluation | Every 10,000 interactions; 32 envs x 2 episodes | Same episode budget and interval; a partial chunk can delay an evaluation by up to 3 interactions |
 
-Counts above were checked against optimizer `step` fields: the final OGPO
+The historical OGPO counts above were checked against optimizer `step` fields: the final OGPO
 actor/critic states have steps 1,990,002 / 3,980,003, starting from step 1 after
 online optimizer reset. This OGPO run performed two critic updates for every
 actor update (including its successful-trajectory update).
@@ -93,3 +93,8 @@ DSRL stores executed chunks and trains on partial terminal chunks with their
 actual duration. This is a difference in sample selection, not evidence of
 cross-episode reward contamination in OGPO critic training. The audit did not
 change the completed OGPO baseline or start a new training run.
+
+Current replay warmup uses the online latent actor and frozen decoder from the
+first interaction. Only optimization is delayed; there is no Gaussian-prior
+collector switch at 10,000 steps. Chunked learners update at chunk boundaries
+and count only physical steps strictly after the threshold.
