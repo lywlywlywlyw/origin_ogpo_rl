@@ -185,7 +185,7 @@ for arg in "$@"; do
 done
 
 export CUDA_VISIBLE_DEVICES=$device
-if [ "$(echo "$jax_frac == -1" | bc)" -eq 1 ]; then
+if [[ "$jax_frac" == "-1" || "$jax_frac" == "-1.0" ]]; then
     export XLA_PYTHON_CLIENT_PREALLOCATE=false
 else
     export XLA_PYTHON_CLIENT_MEM_FRACTION=$jax_frac
@@ -199,7 +199,7 @@ export PYTHONPATH="$PROJECT_ROOT:$PYTHONPATH"
 
 echo "=== OGPO Square | seed=$seed ==="
 
-uv run python ogpo/main.py \
+exec "$PROJECT_ROOT/.venv/bin/python" -m ogpo.main \
     --algo=ogpo \
     --experiment.project=$project \
     --experiment.run_group=$run_group \

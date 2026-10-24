@@ -15,20 +15,38 @@ from ogpo.utils.main_helper import LoggingHelper
 
 
 class CoverageLauncherTests(unittest.TestCase):
-    def launch_args(self, *overrides):
-        script = Path(__file__).resolve().parents[1] / 'scripts/ogpo/square.sh'
+    def launch_args(self, *overrides, exit_code=0):
+        original = Path(__file__).resolve().parents[1] / 'scripts/ogpo/square.sh'
         with tempfile.TemporaryDirectory() as directory:
-            tools = Path(directory)
-            # Capture the actual launch arguments without starting training.
-            (tools / 'uv').write_text(
-                f'#!{sys.executable}\nimport json, sys\nprint(json.dumps(sys.argv[1:]))\n')
-            (tools / 'bc').write_text('#!/bin/sh\ncat >/dev/null\necho 1\n')
+            root = Path(directory)
+            script = root / 'scripts/ogpo/square.sh'
+            script.parent.mkdir(parents=True)
+            script.write_text(original.read_text())
+            python = root / '.venv/bin/python'
+            python.parent.mkdir(parents=True)
+            python.write_text(
+                f'#!{sys.executable}\nimport json, sys\n'
+                f'print(json.dumps(sys.argv[1:]))\nsys.exit({exit_code})\n')
+            python.chmod(0o755)
+            tools = root / 'bin'
+            tools.mkdir()
+            # These external tools must never be needed by the launcher.
             for name in ('uv', 'bc'):
-                (tools / name).chmod(0o755)
+                tool = tools / name
+                tool.write_text('#!/bin/sh\necho unexpected-external-tool >&2\nexit 99\n')
+                tool.chmod(0o755)
             env = dict(os.environ, PATH=f'{tools}:{os.environ["PATH"]}')
             result = subprocess.run(['bash', str(script), *overrides], env=env,
                                     check=True, capture_output=True, text=True)
-            return json.loads(result.stdout.splitlines()[-1])
+            self.assertEqual(result.stderr, '')
+            args = json.loads(result.stdout.splitlines()[-1])
+            self.assertEqual(args[:2], ['-m', 'ogpo.main'])
+            return args
+
+    def test_training_exit_status_is_preserved(self):
+        with self.assertRaises(subprocess.CalledProcessError) as caught:
+            self.launch_args(exit_code=7)
+        self.assertEqual(caught.exception.returncode, 7)
 
     def test_online_only_checkpoint_options_are_forwarded(self):
         args = self.launch_args('--checkpoint_resume=false', '--bc_pi_steps=0',
