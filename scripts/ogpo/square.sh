@@ -154,6 +154,7 @@ fwd_kl_bc_coeff=0.1
 
 # Paths
 SAVE_DIR="exp/ogpo"
+checkpoint_resume=true
 restore_actor_path="null"
 restore_critic_path="null"
 ep_resume=0
@@ -238,6 +239,7 @@ uv run python ogpo/main.py \
     --bc.clip_bc_wrt=$clip_bc_wrt \
     --success_buffer.use_success_buffer=$use_success_buffer \
     --agent.use_success_buffer_q=$use_success_buffer_q \
+    --checkpoint.resume=$checkpoint_resume \
     --checkpoint.restore_actor_path=$restore_actor_path \
     --checkpoint.restore_critic_path=$restore_critic_path \
     --checkpoint.ep_resume=$ep_resume \

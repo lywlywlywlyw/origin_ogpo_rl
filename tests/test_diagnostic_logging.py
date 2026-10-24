@@ -30,6 +30,16 @@ class CoverageLauncherTests(unittest.TestCase):
                                     check=True, capture_output=True, text=True)
             return json.loads(result.stdout.splitlines()[-1])
 
+    def test_online_only_checkpoint_options_are_forwarded(self):
+        args = self.launch_args('--checkpoint_resume=false', '--bc_pi_steps=0',
+                                '--restore_actor_path=/tmp/offline.pkl',
+                                '--restore_critic_path=/tmp/offline.pkl', '--ep_resume=90000')
+        for option in ('--checkpoint.resume=false', '--training.bc_pi_steps=0',
+                       '--checkpoint.restore_actor_path=/tmp/offline.pkl',
+                       '--checkpoint.restore_critic_path=/tmp/offline.pkl',
+                       '--checkpoint.ep_resume=90000'):
+            self.assertIn(option, args)
+
     def test_default_launcher_preserves_yaml_coverage_settings(self):
         args = self.launch_args()
         self.assertFalse(any(arg.startswith(('--agent.cal_action_coverage=',
