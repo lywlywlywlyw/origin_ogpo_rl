@@ -15,13 +15,13 @@ agent:
   # SERL-style Dense -> LayerNorm -> activation in the online actor and critics.
   # Uses 10 Qs: min of 2 random Qs for TD backup; mean of all 10 for the actor
   # and (in the original mode) latent-Q distillation. Decoder stays unchanged.
-  use_layer_norm: true
+  use_layer_norm: false
   # Effective only with use_layer_norm=true AND use_no_tanh=true.
   # Frozen decoder builds a demo buffer before online RL. Every update uses
   # 50% online replay + 50% demo; actor remains SAC on both state sources.
   # Qz distillation uses only N(0,I), and success-buffer BC is bypassed.
   # Mutually exclusive with active use_offline_iql.
-  use_demo_buffer: true
+  use_demo_buffer: false
   demo_inverse_batch_size: 256
   # Effective only when use_layer_norm AND use_no_tanh are also true.
   # True: frozen-decoder offline inversion + latent IQL, followed
@@ -48,7 +48,7 @@ agent:
   iql_early_stopping_patience: 50
   iql_early_stopping_actor_nll_weight: 0.01
   # Skip the encoder actor output tanh.
-  use_no_tanh: true
+  use_no_tanh: false
   # True: skip encoder tanh; use the LPS sphere for ALL decoder initial latents.
   encoder_sphere_limit: false
   # Replace encoder tanh with hard clip(raw Gaussian, -1, 1).

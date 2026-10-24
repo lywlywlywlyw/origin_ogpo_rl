@@ -43,6 +43,8 @@ from ogpo.agents.ogpo import OGPOAgent
 from ogpo.agents.qc import ACFQLAgent
 from ogpo.agents.bptt import OGPOBPTTAgent
 from ogpo.agents.dsrl import DSRLBestOfNAgent
+from ogpo.agents.jgcw import JGCWAgent
+from ogpo.runners.jgcw_runner import run_jgcw_online_rl
 from ogpo.agents.grace import GRACEAgent, offline_iql_enabled, demo_buffer_enabled
 from ogpo.runners.grace_runner import run_grace_online_rl
 from ogpo.agents.anchorq import AnchorQAgent
@@ -139,6 +141,7 @@ AGENTS = {
     "bptt": OGPOBPTTAgent,
     "ogpo_bptt": OGPOBPTTAgent,
     "dsrl": DSRLBestOfNAgent,
+    "jgcw": JGCWAgent,
     "grace": GRACEAgent,
     "anchorq": AnchorQAgent,
     "dsrl_bon": DSRLBestOfNAgent,
@@ -171,7 +174,7 @@ def main():
     checkpoint_config = config["checkpoint"]
     agent_config = config_to_agent_dict(config)
 
-    if algo_name in ('pss', 'gorl', 'grace', 'anchorq'):
+    if algo_name in ('pss', 'gorl', 'grace', 'anchorq', 'jgcw'):
         if checkpoint_config.get('resume'):
             raise ValueError(f'{algo_name} requires checkpoint.resume=false')
         if any(train_config[key] for key in
@@ -363,6 +366,11 @@ def main():
         algo_name, online_steps, bc_only,
         agent_config.get('use_one_step_policy', False),
         train_config.get('q_warmup_steps', 0))
+    if online_steps > 0 and not bc_only:
+        if agent_config.get('cal_action_coverage', False):
+            prefixes.append('action_coverage')
+        if algo_name == 'jgcw' and agent_config.get('cal_q_accuracy', False):
+            prefixes.append('q_accuracy')
 
     run_name = exp_config["run_name"]
     save_dir, logger, wandb_run_id = setup_experiment_logging(
@@ -404,8 +412,8 @@ def main():
     # Restore pre-trained weights
     flow_path = checkpoint_config.get('restore_bc_flow_path')
     if not is_resumed and flow_path:
-        if algo_name not in ('dsrl', 'pss', 'gorl', 'grace', 'anchorq'):
-            raise ValueError('restore_bc_flow_path supports dsrl, pss, gorl, grace and anchorq')
+        if algo_name not in ('dsrl', 'pss', 'gorl', 'grace', 'anchorq', 'jgcw'):
+            raise ValueError('restore_bc_flow_path supports dsrl, pss, gorl, grace, anchorq and jgcw')
         if train_config['bc_pi_steps'] != 0:
             raise ValueError('Shared BC flow initialization requires training.bc_pi_steps=0')
         agent = agent.restore_bc_flow_params(flow_path)
@@ -614,6 +622,9 @@ def main():
 
         agent.config['_encoder_frozen'] = True
 
+    if algo_name == 'jgcw':
+        agent_config['_accuracy_post_success_steps'] = env_config.get('post_success_steps', 0)
+
     runner_kwargs = dict(
         agent=agent,
         env=env,
@@ -674,6 +685,8 @@ def main():
         agent, log_step, final_eval_info, replay_buffer = run_pss_online_rl(
             **runner_kwargs
         )
+    elif algo_name == 'jgcw':
+        agent, log_step, final_eval_info, replay_buffer = run_jgcw_online_rl(**runner_kwargs)
     elif algo_name == 'grace':
         agent, log_step, final_eval_info, replay_buffer = run_grace_online_rl(**runner_kwargs)
     elif algo_name == 'anchorq':

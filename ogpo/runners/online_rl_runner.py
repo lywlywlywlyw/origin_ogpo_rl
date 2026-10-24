@@ -166,7 +166,7 @@ def _sample_success_batch(replay_buffer, success_buffer_batch_size, utd_ratio,
 def _q_warmup_collect(
     agent, env, replay_buffer, *,
     q_warmup_steps, action_dim, has_images, discount, seed,
-    use_success_buffer, mc_regression, encode_fn,
+    use_success_buffer, mc_regression, encode_fn, coverage=None,
 ):
     """Phase A of phase-split q_warmup: env collection with the base actor (no BoN).
 
@@ -200,6 +200,8 @@ def _q_warmup_collect(
                 action_queue.append(a)
         action = action_queue.pop(0)
 
+        if coverage is not None:
+            coverage.observe(ob_full_state if ob_full_state is not None else ob, action)
         raw_next_ob, int_reward, terminated, truncated, info = env.step(action)
         next_ob, next_ob_images, next_ob_full_state = _split_obs(raw_next_ob)
         if encode_fn is not None and next_ob_images is not None:
@@ -376,6 +378,8 @@ def run_online_rl(
     example_batch = train_dataset.sample(())
     action_dim = example_batch['actions'].shape[-1]
     has_images = 'images' in example_batch
+    from ogpo.utils.action_coverage import ActionCoverage
+    coverage = ActionCoverage.from_dataset(train_dataset, config, action_dim)
 
     needs_offline_data = offline_ratio > 0.0
     if not needs_offline_data:
@@ -468,7 +472,7 @@ def run_online_rl(
             q_warmup_steps=q_warmup_steps, action_dim=action_dim,
             has_images=has_images, discount=discount, seed=seed,
             use_success_buffer=use_success_buffer, mc_regression=mc_regression,
-            encode_fn=encode_fn,
+            encode_fn=encode_fn, coverage=coverage,
         )
         agent, log_step = _q_warmup_train(
             agent=agent, replay_buffer=replay_buffer, train_dataset=train_dataset,
@@ -543,6 +547,8 @@ def run_online_rl(
                 action_queue.append(a)
         action = action_queue.pop(0)
 
+        if coverage is not None:
+            coverage.observe(ob_full_state if ob_full_state is not None else ob, action)
         raw_next_ob, int_reward, terminated, truncated, info = env.step(action)
         next_ob, next_ob_images, next_ob_full_state = _split_obs(raw_next_ob)
         if encode_fn is not None and next_ob_images is not None:
@@ -610,6 +616,9 @@ def run_online_rl(
             ob = next_ob
             ob_images = next_ob_images
             ob_full_state = next_ob_full_state
+
+        if coverage is not None and log_interval > 0 and i % log_interval == 0:
+            logger.log(coverage.metrics(), 'action_coverage', step=log_step)
 
         if i < start_training:
             continue
@@ -738,6 +747,8 @@ def run_online_rl(
             print(f"Saving rolling checkpoint at step {log_step}")
             save_rolling_checkpoint(agent, replay_buffer, log_step, i, seed, env_name, wandb_run_id=wandb_run_id, algo_name=algo_name)
 
+    if coverage is not None:
+        logger.log(coverage.metrics(), 'action_coverage', step=log_step)
     save_agent(agent, save_dir, log_step)
     print(f"Online RL training complete. Final step: {log_step}")
     return agent, log_step, eval_info, replay_buffer

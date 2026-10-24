@@ -1,0 +1,22 @@
+# Inherit the matched DSRL run, including its frozen OGPO BC checkpoint.
+_base_: dsrl_ogpo_square_shared.yaml
+experiment:
+  run_name: jgcw_square_shared_ogpo_bc
+  wandb_name: jgcw_square_shared_ogpo_bc
+agent:
+  agent_name: jgcw
+  # Q(s,z) always learns its own TD target. Q(s,a) is an independent diagnostic.
+  train_q_sa: true
+  cal_q_accuracy: true
+  accuracy_s_num: 16          # 4 states from each quarter of successful demonstrations
+  accuracy_a_num: 8           # repeated continuations per fixed (s,z,a), not new first actions
+  accuracy_interval: 100000   # online physical steps; busy evaluations are never queued
+  accuracy_rollout_steps: 1000 # ignore artificial time limits; gamma=.99 tail bound <=.0216
+  accuracy_cpu_count: 2       # separate CPU process; no GPU allocation
+  accuracy_timeout: 3600      # startup/evaluation watchdog, seconds
+
+  cal_action_coverage: true
+  coverage_k: 32
+  coverage_epsilon_a: 0.1     # L2 in executed normalized physical-action coordinates
+  coverage_sample_interval: 1 # evaluate every physical step; retain ALL historical transitions
+  coverage_rebuild_interval: 5000 # exact KNN merges indexed history with all newer points

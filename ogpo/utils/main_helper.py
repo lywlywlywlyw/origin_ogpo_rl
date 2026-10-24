@@ -36,6 +36,12 @@ class LoggingHelper:
         self.log_enabled = log_enabled
         self.first_time = time.time()
         self.last_time = time.time()
+        if log_enabled and wandb_logger is not None and 'q_accuracy' in csv_loggers:
+            # Async results arrive after their policy snapshot's training step.
+            # Keep submission steps monotonic while plotting the snapshot step.
+            wandb_logger.define_metric('q_accuracy/snapshot_step')
+            wandb_logger.define_metric(
+                'q_accuracy/*', step_metric='q_accuracy/snapshot_step', step_sync=False)
 
     def log(self, data: Dict, prefix: str, step: int):
         """Log data to CSV and WandB."""
@@ -331,7 +337,7 @@ def training_log_prefixes(algo_name, online_steps, bc_only=False,
     prefixes = ['eval', 'env', 'offline_agent', 'memory']
     if online_steps > 0 and not bc_only:
         prefixes.append('online_agent')
-        if algo_name in ('dsrl', 'dsrl_bon', 'dsrl_plus_expo', 'pss', 'gorl', 'grace', 'anchorq'):
+        if algo_name in ('dsrl', 'dsrl_bon', 'dsrl_plus_expo', 'pss', 'gorl', 'grace', 'anchorq', 'jgcw'):
             prefixes.append('online_budget')
     if algo_name == 'grace' and online_steps > 0 and not bc_only:
         prefixes.append('q_pretrain')

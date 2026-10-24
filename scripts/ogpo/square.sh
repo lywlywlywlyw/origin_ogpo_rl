@@ -161,10 +161,15 @@ ep_resume=0
 # Logging
 log=true
 plot_q_vs_mc=false
+# Inherit coverage settings from YAML unless explicitly overridden below.
+coverage_overrides=()
 
 # === Parse CLI overrides ===
 for arg in "$@"; do
   case $arg in
+    --cal_action_coverage=*|--coverage_k=*|--coverage_epsilon_a=*|--coverage_sample_interval=*|--coverage_rebuild_interval=*)
+      coverage_overrides+=("--agent.${arg#--}")
+      ;;
     --*=*)
       key="${arg%%=*}"
       value="${arg#*=}"
@@ -311,5 +316,6 @@ uv run python ogpo/main.py \
     --agent.chi_po_R_max=$chi_po_R_max \
     --agent.fwd_kl_reg=$fwd_kl_reg \
     --agent.fwd_kl_bc_coeff=$fwd_kl_bc_coeff \
+    "${coverage_overrides[@]}" \
     --dataset.p_aug=$p_aug \
     --dataset.num_offline_trajs=$num_offline_trajs

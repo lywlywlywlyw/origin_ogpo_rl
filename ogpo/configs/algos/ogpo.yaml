@@ -71,6 +71,13 @@ checkpoint:
 agent:
   agent_name: ogpo
 
+  # Physical-action coverage against all strictly earlier online transitions.
+  cal_action_coverage: true
+  coverage_k: 32
+  coverage_epsilon_a: 0.1
+  coverage_sample_interval: 1
+  coverage_rebuild_interval: 5000
+
   # Learning rates
   lr: 3e-4
   actor_lr: 3e-4
