@@ -11,6 +11,9 @@ from unittest.mock import patch
 import jax
 import jax.numpy as jnp
 import numpy as np
+import optax
+
+from ogpo.agents.modules.dist_helper import hl_gauss_target
 
 from ogpo.agents.dsrl import DSRLBestOfNAgent
 from ogpo.agents.grace import GRACEAgent
@@ -602,6 +605,127 @@ class GraceTests(unittest.TestCase):
         grads = jax.grad(teacher_loss)(grace.action_critic_network.params)
         for leaf in jax.tree.leaves(grads):
             np.testing.assert_array_equal(leaf, jnp.zeros_like(leaf))
+
+    def test_grrl_distillation_mixture_loss_and_frozen_encoder(self):
+        _, base = make_pair()
+        data = jax.tree.map(lambda x: jnp.repeat(x[0, :1], 128, axis=0), batch())
+        rng = jax.random.PRNGKey(49)
+        prior_rng, encoder_rng, mixture_rng = jax.random.split(rng, 3)
+        use_encoder = jax.random.bernoulli(mixture_rng, .5, (128, 1))
+        self.assertGreater(float(use_encoder.mean()), .4)
+        self.assertLess(float(use_encoder.mean()), .6)
+        for sphere, clip in ((False, False), (True, False), (False, True)):
+            with self.subTest(sphere=sphere, clip=clip):
+                grace = GRACEAgent.create(1, jnp.zeros(3), jnp.zeros(2), dict(
+                    base.config, use_grrl_distill=True, num_bins=17,
+                    encoder_sphere_limit=sphere, use_encoder_clip=clip))
+                prior = jax.random.normal(
+                    prior_rng, data['actions'].shape, dtype=data['actions'].dtype)
+                encoded = grace.sample_noise(data['observations'], encoder_rng)
+                z = jax.lax.stop_gradient(jnp.where(use_encoder, encoded, prior))
+                a = grace.noise_to_actions_public(data['observations'], z, noises_constrained=True)
+                teacher_q, teacher_logits = grace.action_critic_network.select('critic')(
+                    data['observations'], actions=a, return_logits=True)
+                probabilities = jax.nn.softmax(teacher_logits, axis=-1)
+                if grace.config['q_agg'] == 'min':
+                    target = probabilities[jnp.argmin(teacher_q, axis=0), jnp.arange(128)]
+                else:
+                    target = probabilities.mean(axis=0)
+                target = jax.lax.stop_gradient(target)
+                np.testing.assert_allclose(target.sum(axis=-1), 1., atol=1e-6)
+                self.assertEqual(teacher_logits.shape, (2, 128, 17))
+
+                def expected_loss(p):
+                    _, logits = grace.critic_network.select('critic')(
+                        data['observations'], actions=z, params=p, return_logits=True)
+                    return -jnp.mean(jnp.sum(target * jax.nn.log_softmax(logits, axis=-1), axis=-1))
+
+                loss, info = grace.critic_loss(data, grace.critic_network.params, rng)
+                np.testing.assert_allclose(loss, expected_loss(grace.critic_network.params), rtol=1e-6)
+                np.testing.assert_allclose(info['noise_mean'], z.mean(), atol=1e-6)
+                np.testing.assert_allclose(info['noise_std'], z.std(), atol=1e-6)
+                np.testing.assert_allclose(info['grrl_encoder_fraction'], use_encoder.mean())
+                actual_grads = jax.grad(lambda p: grace.critic_loss(data, p, rng)[0])(
+                    grace.critic_network.params)
+                assert_tree_equal(self, actual_grads, jax.grad(expected_loss)(grace.critic_network.params))
+
+        def actor_loss(p):
+            current = grace.replace(actor_network=grace.actor_network.replace(params=p))
+            return current.critic_loss(data, grace.critic_network.params, rng)[0]
+
+        def teacher_loss(p):
+            current = grace.replace(action_critic_network=grace.action_critic_network.replace(params=p))
+            return current.critic_loss(data, grace.critic_network.params, rng)[0]
+
+        for loss_fn, params in ((actor_loss, grace.actor_network.params),
+                                (teacher_loss, grace.action_critic_network.params)):
+            for leaf in jax.tree.leaves(jax.grad(loss_fn)(params)):
+                np.testing.assert_array_equal(leaf, jnp.zeros_like(leaf))
+
+    def test_grrl_distillation_disabled_matches_legacy(self):
+        _, grace = make_pair()
+        self.assertFalse(grace.config['use_grrl_distill'])
+        legacy_config = dict(grace.config)
+        legacy_config.pop('use_grrl_distill')
+        legacy = grace.replace(config=legacy_config)
+        data = jax.tree.map(lambda x: x[0], batch())
+        key = jax.random.PRNGKey(19)
+        actual = grace.critic_loss(data, grace.critic_network.params, key)
+        expected = legacy.critic_loss(data, grace.critic_network.params, key)
+        assert_tree_equal(self, actual, expected)
+        self.assertNotIn('grrl_encoder_fraction', actual[1])
+
+    def test_grrl_distillation_update_uses_mixture_and_freezes_decoder(self):
+        _, grace = make_pair()
+        grace = GRACEAgent.create(1, jnp.zeros(3), jnp.zeros(2),
+                                  dict(grace.config, use_grrl_distill=True, num_bins=17))
+        data = batch()
+        updated, metrics = grace.batch_update(data, data, True)
+        self.assertTrue(np.isfinite(metrics['critic/distillation_loss']))
+        self.assertIn('critic/grrl_encoder_fraction', metrics)
+        self.assertEqual(int(updated.critic_network.step), int(grace.critic_network.step) + 4)
+        assert_tree_equal(self, grace.bc_flow_network, updated.bc_flow_network)
+
+    def test_grrl_distribution_aggregation_preserves_teacher_probabilities(self):
+        logits = jnp.array([[[2., 0., -1.], [0., 0., 0.]],
+                            [[-1., 0., 2.], [2., 0., -1.]]])
+        probs = jax.nn.softmax(logits, axis=-1)
+        values = (probs * jnp.array([-1., 0., 1.])).sum(-1)
+        for norm, agg in ((False, 'min'), (False, 'mean'), (True, 'min')):
+            dummy = SimpleNamespace(config=dict(use_layer_norm=norm, q_agg=agg))
+            actual = GRACEAgent._distillation_teacher_probs(dummy, values, logits)
+            expected = probs.mean(0) if norm or agg == 'mean' else probs[jnp.array([0, 1]), jnp.arange(2)]
+            np.testing.assert_allclose(actual, expected, atol=1e-6)
+            np.testing.assert_allclose(actual.sum(-1), 1., atol=1e-6)
+
+    def test_grrl_teacher_td_is_cross_entropy_and_support_covers_rewards(self):
+        _, base = make_pair()
+        grace = GRACEAgent.create(1, jnp.zeros(3), jnp.zeros(2), dict(
+            base.config, use_grrl_distill=True, num_bins=17))
+        self.assertEqual(grace.config['critic_loss_type'], 'hlgauss')
+        self.assertAlmostEqual(grace.config['q_min'], -100.)
+        self.assertAlmostEqual(grace.config['q_max'], 500.)
+        data = jax.tree.map(lambda x: x[0], batch())
+        data = dict(data, masks=jnp.zeros(3), rewards=jnp.array([-1., 5., 0.]))
+        key = jax.random.PRNGKey(15)
+        q, logits = grace.action_critic_network.select('critic')(
+            data['observations'], actions=data['true_actions'], return_logits=True)
+        target = hl_gauss_target(grace.config['q_min'], grace.config['q_max'], 17, data['rewards'])
+        expected = optax.softmax_cross_entropy(logits, target).mean()
+        actual, _ = grace.action_critic_loss(data, grace.action_critic_network.params, key)
+        np.testing.assert_allclose(actual, expected, atol=1e-6)
+        self.assertFalse(np.isclose(actual, jnp.mean((q-data['rewards'])**2)))
+        updated, _ = grace.pretrain_action_q(data)
+        for field in ('actor_network', 'bc_flow_network', 'critic_network'):
+            assert_tree_equal(self, getattr(updated, field), getattr(grace, field))
+        self.assertTrue(any(not np.array_equal(x, y) for x, y in zip(
+            jax.tree.leaves(updated.action_critic_network.params),
+            jax.tree.leaves(grace.action_critic_network.params))))
+        for overrides in (dict(grrl_q_min=1., grrl_q_max=0.),
+                          dict(grrl_q_max=float('inf')), dict(num_bins=1)):
+            with self.assertRaisesRegex(ValueError, 'GR-RL'):
+                GRACEAgent.create(1, jnp.zeros(3), jnp.zeros(2), dict(
+                    grace.config, **overrides))
 
     def test_latent_step_uses_updated_online_action_critic(self):
         _, grace = make_pair()

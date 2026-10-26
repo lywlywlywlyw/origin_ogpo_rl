@@ -24,6 +24,7 @@ from ogpo.agents.modules.bc_helper import (
 )
 from ogpo.agents.modules.q_helper import (
     get_q_values as _get_q_values,
+    compute_td_loss,
 )
 from ogpo.agents.modules.pg_helper import (
     sample_flow_actions_ode,
@@ -46,7 +47,9 @@ class GRACEAgent(flax.struct.PyTreeNode):
     unsquashed, tanh-bounded, hard-clipped, or projected onto the LPS sphere of radius sqrt(noise_dim).
     The frozen flow maps the resulting latent to actions.
     The action critic learns chunk returns via TD. The latent critic regresses
-    onto its values at decoded latents. With use_no_tanh, use_layer_norm and
+    onto its values at decoded latents. With use_grrl_distill, both Qs are
+    categorical: action Q uses HL-Gauss TD and latent Q uses teacher-distribution
+    cross-entropy, with 50/50 prior/encoder sampling. With use_no_tanh, use_layer_norm and
     use_offline_iql, offline latent IQL precedes direct online latent TD instead.
     """
 
@@ -146,17 +149,38 @@ class GRACEAgent(flax.struct.PyTreeNode):
     def critic_loss(self, batch, grad_params, rng):
         if self.latent_iql_enabled:
             return self.latent_td_loss(batch, grad_params, rng)
-        # Use the same latent prior as the decoder, including sphere projection.
-        noises = jax.random.normal(rng, batch['actions'].shape, dtype=batch['actions'].dtype)
-        noises = self.constrain_encoder_output(noises)
+        if self.config.get('use_grrl_distill', False):
+            prior_rng, encoder_rng, mixture_rng = jax.random.split(rng, 3)
+            prior = jax.random.normal(
+                prior_rng, batch['actions'].shape, dtype=batch['actions'].dtype)
+            encoder_noises = self.sample_noise(batch['observations'], encoder_rng)
+            # GR-RL Eq. (4): choose a source for each entire latent vector.
+            use_encoder = jax.random.bernoulli(
+                mixture_rng, p=0.5, shape=prior.shape[:-1] + (1,))
+            noises = jax.lax.stop_gradient(jnp.where(use_encoder, encoder_noises, prior))
+        else:
+            # Preserve the original prior and RNG path when the switch is off.
+            noises = jax.random.normal(rng, batch['actions'].shape, dtype=batch['actions'].dtype)
+            noises = self.constrain_encoder_output(noises)
         actions = self.noise_to_actions_public(
             batch['observations'], noises, noises_constrained=True)
-        target_q = jax.lax.stop_gradient(self._aggregate_q(
-            self.action_critic_network.select('critic')(
-                batch['observations'], actions=actions)))
-        q = self.critic_network.select('critic')(
-            batch['observations'], actions=noises, params=grad_params)
-        critic_loss = jnp.mean(jnp.square(q - target_q))
+        if self.config.get('use_grrl_distill', False):
+            teacher_q, teacher_logits = self.action_critic_network.select('critic')(
+                batch['observations'], actions=actions, return_logits=True)
+            target_probs = jax.lax.stop_gradient(
+                self._distillation_teacher_probs(teacher_q, teacher_logits))
+            target_q = jnp.sum(target_probs * jnp.linspace(
+                self.config['q_min'], self.config['q_max'], self.config['num_bins']), axis=-1)
+            q, logits = self.critic_network.select('critic')(
+                batch['observations'], actions=noises, params=grad_params, return_logits=True)
+            critic_loss = optax.softmax_cross_entropy(logits, target_probs).mean()
+        else:
+            target_q = jax.lax.stop_gradient(self._aggregate_q(
+                self.action_critic_network.select('critic')(
+                    batch['observations'], actions=actions)))
+            q = self.critic_network.select('critic')(
+                batch['observations'], actions=noises, params=grad_params)
+            critic_loss = jnp.mean(jnp.square(q - target_q))
         info = {
             'critic_loss': critic_loss,
             'distillation_loss': critic_loss,
@@ -164,7 +188,19 @@ class GRACEAgent(flax.struct.PyTreeNode):
             'target_q_mean': target_q.mean(),
             'noise_mean': noises.mean(), 'noise_std': noises.std(),
         }
+        if self.config.get('use_grrl_distill', False):
+            info['grrl_encoder_fraction'] = use_encoder.mean()
         return critic_loss, info
+
+    def _distillation_teacher_probs(self, values, logits):
+        """Aggregate distributions consistently with the existing Q ensemble rule."""
+        probs = jax.nn.softmax(logits, axis=-1)
+        if values.ndim == 1:  # Value with a single head has no ensemble axis.
+            return probs
+        if not self.config.get('use_layer_norm', False) and self.config['q_agg'] == 'min':
+            indices = jnp.argmin(values, axis=0)
+            return jnp.take_along_axis(probs, indices[None, ..., None], axis=0)[0]
+        return probs.mean(axis=0)
 
     def _aggregate_q(self, qs):
         # SERL uses all ensemble members for the actor and online-Q values.
@@ -197,9 +233,18 @@ class GRACEAgent(flax.struct.PyTreeNode):
             next_q -= self.actor_network.select('temp')() * jnp.clip(log_probs, -100, 100)
         target = jnp.clip(batch['rewards'] + self.config['discount'] ** batch.get(
             'chunk_length', self.config['horizon_length']) * batch['masks'] * next_q, -500., 500.)
-        q = self.action_critic_network.select('critic')(
-            batch['observations'], actions=batch['true_actions'], params=grad_params)
-        loss = jnp.mean(jnp.square(q - target))
+        if self.config.get('use_grrl_distill', False) and not self.latent_iql_enabled:
+            q, logits = self.action_critic_network.select('critic')(
+                batch['observations'], actions=batch['true_actions'], params=grad_params,
+                return_logits=True)
+            loss, _ = compute_td_loss(
+                q, jax.lax.stop_gradient(target), loss_type='hlgauss', q_logits=logits,
+                q_min=self.config['q_min'], q_max=self.config['q_max'],
+                num_bins=self.config['num_bins'])
+        else:
+            q = self.action_critic_network.select('critic')(
+                batch['observations'], actions=batch['true_actions'], params=grad_params)
+            loss = jnp.mean(jnp.square(q - target))
         return loss, {'action_critic/loss': loss, 'action_critic/q_mean': q.mean(),
                       'action_critic/target_q_mean': target.mean()}
 
@@ -671,6 +716,7 @@ class GRACEAgent(flax.struct.PyTreeNode):
     @classmethod
     def create(cls, seed, ex_observations, ex_actions, config):
         config = dict(config)
+        config.setdefault('use_grrl_distill', False)
         config.setdefault('use_no_tanh', False)
         config.setdefault('use_offline_iql', False)
         config.setdefault('use_demo_buffer', False)
@@ -753,6 +799,23 @@ class GRACEAgent(flax.struct.PyTreeNode):
             raise ValueError('decoder_noise_clip must be positive')
         if config.get('critic_updates_per_actor', 1) not in (1, 2):
             raise ValueError('critic_updates_per_actor must be 1 or 2')
+        if config['use_grrl_distill'] and not offline_iql_enabled(config):
+            # Both teacher and student need categorical outputs for Eq. (4).
+            # GRACE shapes per-step rewards to -1/+5; main's generic robomimic
+            # bounds have q_max=0 and would incorrectly exclude success returns.
+            discount = config['discount']
+            if not 0 <= discount < 1:
+                raise ValueError('GR-RL distillation requires 0 <= discount < 1')
+            config['critic_loss_type'] = 'hlgauss'
+            for key, reward in (('q_min', -1.), ('q_max', 5.)):
+                value = config.get('grrl_' + key)
+                config[key] = reward / (1 - discount) if value is None else float(value)
+            if (not math.isfinite(config['q_min']) or not math.isfinite(config['q_max'])
+                    or config['q_min'] >= config['q_max']):
+                raise ValueError('GR-RL support requires finite grrl_q_min < grrl_q_max')
+            if (isinstance(config['num_bins'], bool) or not isinstance(config['num_bins'], int)
+                    or config['num_bins'] < 2):
+                raise ValueError('GR-RL distillation requires integer num_bins >= 2')
         rng = jax.random.PRNGKey(seed)
         rng, init_rng = jax.random.split(rng, 2)
 

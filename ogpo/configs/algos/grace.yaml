@@ -2,6 +2,11 @@
 _base_: dsrl.yaml
 agent:
   agent_name: grace
+  use_grrl_distill: false  # 50/50 z mixture + categorical cross-entropy distillation.
+  # Categorical Q support; null derives [-1/(1-discount), 5/(1-discount)]
+  # from GRACE's -1/+5 rewards. Reuses num_bins (default 256).
+  grrl_q_min: null
+  grrl_q_max: null
   # null resolves to the action interval half-width / latent action_magnitude.
   gradient_delta_a: null
   gradient_delta_z: null

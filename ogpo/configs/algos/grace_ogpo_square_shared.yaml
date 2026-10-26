@@ -5,6 +5,14 @@ experiment:
   wandb_name: grace_square_shared_ogpo_bc
 agent:
   agent_name: grace
+  # GR-RL Eq. (4): per-sample 50% Gaussian prior + 50% current encoder output.
+  # Enables categorical action/latent Q heads; inactive in offline-IQL mode.
+  # Action Q uses HL-Gauss TD targets; latent Q matches its full distribution.
+  use_grrl_distill: true  # 50/50 z mixture + categorical cross-entropy distillation.
+  # Categorical Q support; null derives [-1/(1-discount), 5/(1-discount)]
+  # from GRACE's -1/+5 rewards. Reuses num_bins (default 256).
+  grrl_q_min: null
+  grrl_q_max: null
   # Offline action-Q TD pretraining before online collection (decoder stays frozen).
   pretrain_qnet: false
   increase_num: 2
@@ -19,7 +27,7 @@ agent:
   # Effective only with use_layer_norm=true AND use_no_tanh=true.
   # Frozen decoder builds a demo buffer before online RL. Every update uses
   # 50% online replay + 50% demo; actor remains SAC on both state sources.
-  # Qz distillation uses only N(0,I), and success-buffer BC is bypassed.
+  # Qz distillation follows use_grrl_distill; success-buffer BC is bypassed.
   # Mutually exclusive with active use_offline_iql.
   use_demo_buffer: false
   demo_inverse_batch_size: 256
@@ -27,7 +35,7 @@ agent:
   # True: frozen-decoder offline inversion + latent IQL, followed
   # by direct online latent TD. No action-Q training or distillation.
   # This takes precedence over pretrain_qnet above.
-  # False: original action-Q TD + Gaussian-prior latent-Q distillation.
+  # False: action-Q TD + latent-Q distillation (see use_grrl_distill).
   # Distillation uses the same sampling path regardless of demo-buffer mode.
   use_offline_iql: false
   iql_steps: 500000
