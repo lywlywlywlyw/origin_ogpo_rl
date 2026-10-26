@@ -4,6 +4,7 @@ os.environ.setdefault('JAX_PLATFORMS', 'cpu')
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import h5py
@@ -27,7 +28,7 @@ from ogpo.utils.q_accuracy import (
 def make_agent(train=True):
     config = config_to_agent_dict(load_config('jgcw_ogpo_square_shared'))
     config.update(actor_hidden_dims=(8, 8), value_hidden_dims=(8, 8), num_qs=2,
-                  train_q_sa=train, cal_q_accuracy=False, cal_action_coverage=False)
+                  train_q_sa=train, cal_q_accuracy=False, cal_action_coverage=False, use_aug_z=False)
     return JGCWAgent.create(1, jnp.zeros(3), jnp.zeros(2), config)
 
 
@@ -92,7 +93,8 @@ class IndependentQTests(unittest.TestCase):
         base = config_to_agent_dict(load_config('jgcw'))
         self.assertEqual(base['agent_name'], 'jgcw')
         self.assertFalse(base['train_q_sa'])
-        self.assertTrue(config['train_q_sa'])
+        self.assertFalse(config['train_q_sa'])
+        self.assertTrue(config['use_aug_z'])
         self.assertIn('online_budget', training_log_prefixes('jgcw', 100))
         config.update(train_q_sa=False, cal_q_accuracy=True)
         with self.assertRaisesRegex(ValueError, 'train_q_sa'):
@@ -129,6 +131,92 @@ class IndependentQTests(unittest.TestCase):
             self.assertEqual(int(rows[-1]['history_size']), 12)
             self.assertIn('action_span/1', rows[-1])
             self.assertNotIn('action_span/2', rows[-1])
+
+
+class AugmentedZTests(unittest.TestCase):
+    def test_gaussian_augmentation_and_grace_inverse(self):
+        class ConstantFlow:
+            def select(self, name):
+                return lambda obs, x, t: jnp.ones_like(x) * .2
+        dummy = SimpleNamespace(
+            config=dict(flow_steps=4, aug_z_num=3, aug_z_sigma=.02),
+            bc_flow_network=ConstantFlow())
+        dummy.inverse_fm_batch = lambda obs, a: JGCWAgent.inverse_fm_batch.__wrapped__(dummy, obs, a)
+        obs = jnp.zeros((2, 3))
+        actions = jnp.full((2, 8), .999)
+        key = jax.random.PRNGKey(13)
+        actual = JGCWAgent.augment_z(dummy, obs, actions, key)
+        perturbed = actions[:, None, :] + .02 * jax.random.normal(key, (2, 3, 8))
+        self.assertGreater(float(perturbed.max()), 1.)
+        np.testing.assert_allclose(actual, perturbed - .2, atol=1e-6)
+        from ogpo.agents.grace import GRACEAgent
+        np.testing.assert_array_equal(
+            dummy.inverse_fm_batch(obs, actions),
+            GRACEAgent.inverse_fm_batch.__wrapped__(dummy, obs, actions))
+
+    def test_loss_and_gradient_match_detached_original_q(self):
+        agent = make_agent(False)
+        agent = agent.replace(config=dict(agent.config, use_aug_z=True, aug_z_num=2))
+        batch = jax.tree.map(lambda x: x[0], make_batch())
+        key = jax.random.PRNGKey(7)
+        z = agent.augment_z(batch['observations'], batch['true_actions'],
+                            jax.random.fold_in(key, 918))
+        self.assertEqual(z.shape, (3, 2, 8))
+        q = agent.critic_network.select('critic')(
+            batch['observations'], actions=batch['actions'])
+        def expected_loss(params):
+            td, _ = DSRLBestOfNAgent.critic_loss(agent, batch, params, key)
+            q_aug = agent.critic_network.select('critic')(
+                jnp.repeat(batch['observations'], 2, axis=0),
+                actions=z.reshape(-1, 8), params=params).reshape(2, 3, 2)
+            return td + jnp.mean(jnp.square(q_aug - q[..., None]))
+        actual, info = agent.critic_loss(batch, agent.critic_network.params, key)
+        np.testing.assert_allclose(actual, expected_loss(agent.critic_network.params), atol=1e-6)
+        np.testing.assert_allclose(actual, info['td_loss'] + info['aug_z_loss'])
+        self.assertGreater(float(info['aug_z_loss']), 0.)
+        actual_grad = jax.grad(lambda p: agent.critic_loss(batch, p, key)[0])(
+            agent.critic_network.params)
+        expected_grad = jax.grad(expected_loss)(agent.critic_network.params)
+        for x, y in zip(jax.tree.leaves(actual_grad), jax.tree.leaves(expected_grad)):
+            np.testing.assert_allclose(x, y, atol=1e-6, rtol=1e-5)
+
+    def test_augmented_updates_cover_regular_and_success_paths(self):
+        initial = make_agent(False)
+        initial = initial.replace(config=dict(initial.config, use_aug_z=True))
+        batch = jax.tree.map(lambda x: x[:1], make_batch())
+        success_batch = dict(batch, true_actions=batch['true_actions'] + .1,
+                             rewards=batch['rewards'] + .5)
+        for success in (None, False, True):
+            replay_success = success_batch if success is not None else None
+            updated, info = initial.batch_update(batch, replay_success, bool(success))
+            self.assertEqual(int(updated.critic_network.step),
+                             int(initial.critic_network.step) + 2)
+            self.assertTrue(np.isfinite(info['critic/aug_z_loss']))
+            assert_equal(self, initial.bc_flow_network, updated.bc_flow_network)
+            # Compare every extra critic step to an explicit augmented-loss update.
+            single = initial.replace(config=dict(initial.config, critic_updates_per_actor=1,
+                                                  use_success_buffer_q=False))
+            first, _ = single.batch_update(batch, replay_success, bool(success))
+            rng = (jax.random.fold_in(jax.random.split(initial.rng, 3)[2], 1)
+                   if success is None else jax.random.split(initial.rng, 4)[3])
+            sample = jax.tree.map(lambda x: x[0], success_batch if success else batch)
+            state, _ = first.critic_network.apply_loss_fn(
+                lambda p: first.critic_total_loss(sample, p, rng))
+            first.target_update(state, 'critic')
+            # Fused scan and standalone updates may differ by float32 rounding.
+            for x, y in zip(jax.tree.leaves(updated.critic_network), jax.tree.leaves(state)):
+                np.testing.assert_allclose(x, y, atol=1e-6, rtol=1e-5)
+
+    def test_invalid_augmentation_config(self):
+        base = dict(make_agent(False).config)
+        for options, error in [({'aug_z_num': 0}, 'aug_z_num'),
+                               ({'aug_z_num': 1.5}, 'aug_z_num'),
+                               ({'aug_z_num': True}, 'aug_z_num'),
+                               ({'aug_z_sigma': -.1}, 'aug_z_sigma'),
+                               ({'aug_z_sigma': float('nan')}, 'aug_z_sigma'),
+                               ({'use_aug_z': True, 'noise_chunk_length': 1}, 'noise_chunk_length')]:
+            with self.assertRaisesRegex(ValueError, error):
+                JGCWAgent.create(1, jnp.zeros(3), jnp.zeros(2), dict(base, **options))
 
 
 class CoverageTests(unittest.TestCase):

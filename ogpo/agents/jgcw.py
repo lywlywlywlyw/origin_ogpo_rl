@@ -1,7 +1,8 @@
-"""DSRL latent TD critic with an optional independent action TD critic.
+"""DSRL latent TD critic with optional augmentation consistency and action Q.
 
 The action critic is diagnostic: neither the actor nor the latent critic uses it.
 """
+import math
 from typing import Any
 
 import jax
@@ -13,6 +14,53 @@ from ogpo.agents.modules.flax_utils import TrainState
 
 class JGCWAgent(DSRLBestOfNAgent):
     action_critic_network: Any = None
+
+    @jax.jit
+    def inverse_fm_batch(self, observations, actions):
+        """GRACE's reverse Euler integration, without constraining recovered z."""
+        if observations.shape[0] != actions.shape[0] or actions.ndim != 2:
+            raise ValueError('Inverse FM expects equally sized observation/action batches')
+        steps = self.config['flow_steps']
+
+        def step(x, i):
+            t = jnp.full((x.shape[0], 1), 1. - i / steps)
+            velocity = self.bc_flow_network.select('actor_bc_flow')(observations, x, t)
+            return x - velocity / steps, None
+
+        return jax.lax.scan(step, actions, jnp.arange(steps))[0]
+
+    def augment_z(self, observations, actions, rng):
+        """Perturb replay action chunks and invert all B*N samples together."""
+        count = self.config['aug_z_num']
+        noise = jax.random.normal(
+            rng, (actions.shape[0], count, actions.shape[-1]), dtype=actions.dtype)
+        # Preserve the requested Gaussian perturbation, including near action bounds.
+        augmented = actions[:, None, :] + self.config['aug_z_sigma'] * noise
+        repeated_obs = jnp.repeat(observations, count, axis=0)
+        latents = self.inverse_fm_batch(
+            repeated_obs, augmented.reshape(-1, actions.shape[-1]))
+        return jax.lax.stop_gradient(latents.reshape(actions.shape[0], count, -1))
+
+    def critic_loss(self, batch, grad_params, rng):
+        td_loss, info = super().critic_loss(batch, grad_params, rng)
+        if not self.config.get('use_aug_z', False):
+            return td_loss, info
+
+        # Derive an independent key without changing DSRL's TD/actor RNG streams.
+        z_aug = self.augment_z(
+            batch['observations'], batch['true_actions'], jax.random.fold_in(rng, 918))
+        count = self.config['aug_z_num']
+        q_aug = self.critic_network.select('critic')(
+            jnp.repeat(batch['observations'], count, axis=0),
+            actions=z_aug.reshape(-1, z_aug.shape[-1]), params=grad_params)
+        q_aug = q_aug.reshape(q_aug.shape[0], z_aug.shape[0], count)
+        # Match each ensemble member to its original Q(s,z); only z_aug is fitted.
+        q = self.critic_network.select('critic')(
+            batch['observations'], actions=batch['actions'], params=grad_params)
+        consistency_loss = jnp.mean(jnp.square(q_aug - jax.lax.stop_gradient(q)[..., None]))
+        total_loss = td_loss + consistency_loss
+        return total_loss, {**info, 'td_loss': td_loss,
+                            'aug_z_loss': consistency_loss, 'critic_loss': total_loss}
 
     def action_critic_loss(self, batch, grad_params, rng):
         # Match DSRL's next latent sample and TD convention exactly.
@@ -75,6 +123,17 @@ class JGCWAgent(DSRLBestOfNAgent):
     @classmethod
     def create(cls, seed, ex_observations, ex_actions, config):
         config = dict(config)
+        config.setdefault('use_aug_z', False)
+        config.setdefault('aug_z_num', 1)
+        config.setdefault('aug_z_sigma', 0.02)
+        count, sigma = config['aug_z_num'], config['aug_z_sigma']
+        if isinstance(count, bool) or not isinstance(count, int) or count < 1:
+            raise ValueError('aug_z_num must be a positive integer')
+        if (isinstance(sigma, bool) or not isinstance(sigma, (int, float))
+                or not math.isfinite(sigma) or sigma < 0):
+            raise ValueError('aug_z_sigma must be a finite nonnegative standard deviation')
+        if config['use_aug_z'] and config.get('noise_chunk_length', -1) != -1:
+            raise ValueError('use_aug_z requires noise_chunk_length=-1 for full-chunk inverse latents')
         config.setdefault('train_q_sa', False)
         config.setdefault('cal_q_accuracy', False)
         if config['cal_q_accuracy'] and not config['train_q_sa']:

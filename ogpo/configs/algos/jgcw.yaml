@@ -2,6 +2,9 @@
 _base_: dsrl.yaml
 agent:
   agent_name: jgcw
+  use_aug_z: false
+  aug_z_num: 1
+  aug_z_sigma: 0.02
   train_q_sa: false
   cal_q_accuracy: false
   cal_action_coverage: false

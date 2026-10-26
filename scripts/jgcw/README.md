@@ -20,12 +20,24 @@ CUDA_VISIBLE_DEVICES=0 nohup bash scripts/jgcw/square_shared_ogpo_bc.sh \
   > run_logs/jgcw_square_shared_ogpo_bc.log 2>&1 &
 ```
 
-The Square config enables action-Q training, Q accuracy evaluation, and action
-coverage by default. It restores the shared OGPO BC checkpoint and starts online
+The Square config enables latent augmentation consistency by default; action-Q
+training, Q accuracy evaluation, and action coverage default to disabled. It restores the shared OGPO BC checkpoint and starts online
 training directly.
 
-Q(s,z) always learns its own TD target and controls the actor, exactly as in
-DSRL. `train_q_sa` additionally trains a separate action-space TD critic with
+Q(s,z) learns its own TD target and controls the actor. With `use_aug_z=false`,
+its updates match DSRL exactly. Square defaults to `use_aug_z=true`,
+`aug_z_num=1`, and `aug_z_sigma=0.02`. For every latent critic update (including
+extra success-buffer updates), add independent N(0, sigma²) noise to each replay
+action chunk, invert the augmented actions with GRACE's reverse Euler method,
+and add `mean((Q(s,z_aug) - stop_gradient(Q(s,z)))²)` to the TD loss with unit
+weight. The loss averages over samples, augmentations and ensemble members.
+Actions and recovered latents are not clipped. The frozen decoder and actor do
+not receive gradients from this loss. Inversion is approximate because Euler
+integration and the forward decoder's final action clipping are not exactly
+invertible. One augmentation keeps the extra reverse-flow batch at replay batch
+size; larger `aug_z_num` increases inversion and critic evaluation cost linearly.
+This requires `noise_chunk_length=-1`. Log `critic/td_loss`, `critic/aug_z_loss`
+and their sum `critic/critic_loss` under `online_agent`. `train_q_sa` additionally trains a separate action-space TD critic with
 the same architecture, optimizer and replay minibatches. It has its own target
 network and optimizer state. It does not supervise Q(s,z) or affect the actor.
 It receives the same extra success-buffer critic updates. Both critics' update
