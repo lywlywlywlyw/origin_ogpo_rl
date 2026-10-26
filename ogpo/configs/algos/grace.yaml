@@ -2,6 +2,8 @@
 _base_: dsrl.yaml
 agent:
   agent_name: grace
+  use_faster_distill: false  # Gaussian best-of-N, then MSE on the selected z only.
+  faster_distill_num_samples: 8
   use_grrl_distill: false  # 50/50 z mixture + categorical cross-entropy distillation.
   # Categorical Q support; null derives [-1/(1-discount), 5/(1-discount)]
   # from GRACE's -1/+5 rewards. Reuses num_bins (default 256).

@@ -51,6 +51,7 @@ class GRACEAgent(flax.struct.PyTreeNode):
     categorical: action Q uses HL-Gauss TD and latent Q uses teacher-distribution
     cross-entropy, with 50/50 prior/encoder sampling. With use_no_tanh, use_layer_norm and
     use_offline_iql, offline latent IQL precedes direct online latent TD instead.
+    use_faster_distill selects a Gaussian seed by latent Q before winner-only MSE.
     """
 
     rng: Any
@@ -149,7 +150,10 @@ class GRACEAgent(flax.struct.PyTreeNode):
     def critic_loss(self, batch, grad_params, rng):
         if self.latent_iql_enabled:
             return self.latent_td_loss(batch, grad_params, rng)
-        if self.config.get('use_grrl_distill', False):
+        if self.config.get('use_faster_distill', False):
+            noises, selection_info = self._select_faster_distill_noise(
+                batch['observations'], batch['actions'], rng)
+        elif self.config.get('use_grrl_distill', False):
             prior_rng, encoder_rng, mixture_rng = jax.random.split(rng, 3)
             prior = jax.random.normal(
                 prior_rng, batch['actions'].shape, dtype=batch['actions'].dtype)
@@ -190,7 +194,27 @@ class GRACEAgent(flax.struct.PyTreeNode):
         }
         if self.config.get('use_grrl_distill', False):
             info['grrl_encoder_fraction'] = use_encoder.mean()
+        if self.config.get('use_faster_distill', False):
+            info.update(selection_info)
         return critic_loss, info
+
+    def _select_faster_distill_noise(self, observations, example_noises, rng):
+        """FASTER Algorithm 1: score N Gaussian seeds, decode only the winner."""
+        count = self.config['faster_distill_num_samples']
+        batch_size, noise_dim = example_noises.shape
+        candidates = jax.random.normal(
+            rng, (batch_size, count, noise_dim), dtype=example_noises.dtype)
+        scores = jax.lax.stop_gradient(self._aggregate_q(
+            self.critic_network.select('critic')(
+                jnp.repeat(observations, count, axis=0),
+                actions=candidates.reshape(-1, noise_dim))))
+        scores = scores.reshape(batch_size, count)
+        winners = jnp.argmax(scores, axis=-1)
+        selected = jax.lax.stop_gradient(candidates[jnp.arange(batch_size), winners])
+        return selected, {
+            'faster_selected_q_mean': scores[jnp.arange(batch_size), winners].mean(),
+            'faster_candidate_q_mean': scores.mean(),
+        }
 
     def _distillation_teacher_probs(self, values, logits):
         """Aggregate distributions consistently with the existing Q ensemble rule."""
@@ -717,6 +741,14 @@ class GRACEAgent(flax.struct.PyTreeNode):
     def create(cls, seed, ex_observations, ex_actions, config):
         config = dict(config)
         config.setdefault('use_grrl_distill', False)
+        config.setdefault('use_faster_distill', False)
+        config.setdefault('faster_distill_num_samples', 8)
+        if config['use_faster_distill']:
+            if config['use_grrl_distill']:
+                raise ValueError('use_faster_distill and use_grrl_distill are mutually exclusive')
+            count = config['faster_distill_num_samples']
+            if isinstance(count, bool) or not isinstance(count, int) or count < 1:
+                raise ValueError('faster_distill_num_samples must be a positive integer')
         config.setdefault('use_no_tanh', False)
         config.setdefault('use_offline_iql', False)
         config.setdefault('use_demo_buffer', False)

@@ -5,10 +5,15 @@ experiment:
   wandb_name: grace_square_shared_ogpo_bc
 agent:
   agent_name: grace
+  # FASTER Algorithm 1: N Gaussian z -> latent-Q argmax -> decode only winner;
+  # regress Q(s,z*) to stop_gradient(Q(s,decoder(s,z*))) with MSE.
+  # Mutually exclusive with use_grrl_distill; inactive in offline-IQL mode.
+  use_faster_distill: true
+  faster_distill_num_samples: 8
   # GR-RL Eq. (4): per-sample 50% Gaussian prior + 50% current encoder output.
   # Enables categorical action/latent Q heads; inactive in offline-IQL mode.
   # Action Q uses HL-Gauss TD targets; latent Q matches its full distribution.
-  use_grrl_distill: true  # 50/50 z mixture + categorical cross-entropy distillation.
+  use_grrl_distill: false  # 50/50 z mixture + categorical cross-entropy distillation.
   # Categorical Q support; null derives [-1/(1-discount), 5/(1-discount)]
   # from GRACE's -1/+5 rewards. Reuses num_bins (default 256).
   grrl_q_min: null
@@ -27,7 +32,7 @@ agent:
   # Effective only with use_layer_norm=true AND use_no_tanh=true.
   # Frozen decoder builds a demo buffer before online RL. Every update uses
   # 50% online replay + 50% demo; actor remains SAC on both state sources.
-  # Qz distillation follows use_grrl_distill; success-buffer BC is bypassed.
+  # Qz uses the selected distillation mode; success-buffer BC is bypassed.
   # Mutually exclusive with active use_offline_iql.
   use_demo_buffer: false
   demo_inverse_batch_size: 256
