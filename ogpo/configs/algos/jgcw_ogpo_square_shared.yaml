@@ -5,10 +5,13 @@ experiment:
   wandb_name: jgcw_square_shared_ogpo_bc
 agent:
   agent_name: jgcw
+  inverse_fm_iterations: 16  # safeguarded reconstruction solver iterations
+  inverse_fm_radius: 0.5     # maximum L2 distance from the original replay latent
+  inverse_fm_batch_size: 32  # fixed inverse microbatch; bounds Jacobian memory
   # Q(s,z) always learns its own TD target. Q(s,a) is an independent diagnostic.
   # Cache reverse-flow latents at episode insertion; reuse them for Q consistency.
   use_aug_z: true
-  aug_z_num: 50              # one cached sample per replay chunk; fixed-batch inverse
+  aug_z_num: 50              # cached samples per replay chunk; fixed-batch inverse
   aug_z_sigma: 0.02         # per-coordinate Gaussian standard deviation
   train_q_sa: false
   cal_q_accuracy: false

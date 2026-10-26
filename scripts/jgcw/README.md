@@ -26,9 +26,10 @@ training directly.
 
 Q(s,z) learns its own TD target and controls the actor. With `use_aug_z=false`,
 its updates match DSRL exactly. Square defaults to `use_aug_z=true`,
-`aug_z_num=1`, and `aug_z_sigma=0.02`. At episode completion, before inserting
+`aug_z_num=50`, and `aug_z_sigma=0.02`. At episode completion, before inserting
 transitions into replay, add independent N(0, sigma²) noise to each action chunk
-and invert the augmented actions with GRACE's reverse Euler method. Cache
+and invert the augmented actions with UniSteer's per-step fixed-point method
+(Sec. 4.1 and Appendix A.2 of the local UniSteer paper). Cache
 `z_aug` as float32 with shape `(aug_z_num, noise_dim)` per transition. Inversion
 uses fixed batches of `batch_size` transitions, padding the final batch and
 discarding padded outputs, to avoid compilation for different episode lengths.
@@ -41,10 +42,35 @@ transition reuses its fixed augmentations rather than drawing fresh noise.
 Ordinary and success replay sampling both preserve the cached field. Training
 never runs the inverse decoder; a missing or incompatible cache raises an error.
 The loss averages over samples, augmentations and ensemble members.
-Actions and recovered latents are not clipped. The frozen decoder and actor do
-not receive gradients from this loss. Inversion is approximate because Euler
-integration and the forward decoder's final action clipping are not exactly
-invertible. One augmentation keeps the reverse-flow batch at replay batch size;
+Gaussian action targets are not clipped. The inverse reconstructs the actual
+executed decoder: forward Euler at times `0, ..., (K-1)/K`, followed by action
+clipping. The frozen decoder and actor do not receive training gradients from
+this loss (decoder Jacobians are used only to solve for cached latents).
+
+Plain UniSteer Sec. 4.1 Picard iteration was unstable on this checkpoint: its
+`dt*L<1` contraction assumption is not guaranteed. JGCW therefore uses a
+safeguarded damped Gauss-Newton / Levenberg-Marquardt reconstruction solve,
+**not the paper's literal fixed-point algorithm**. It starts from the original
+replay latent, uses damping `1e-3`, caps each proposed step at L2 `0.25`, and
+tries six step sizes. Only finite, strictly lower reconstruction errors are
+accepted. `inverse_fm_iterations=16` is now the total solve iteration budget,
+not refinements per Euler step. `inverse_fm_radius=0.5` limits total L2 change
+from the original latent; the actor's `[-1,1]` support is also enforced.
+Consequently unreachable targets get a local best approximation, not a claimed
+exact inverse. A rejected solve retains the original latent and contributes
+zero consistency loss. Zero perturbation of a correctly paired `(s,z,a)` also
+preserves z. Final clipping is non-injective and noisy targets may be unreachable.
+
+Inversion remains at episode insertion, with fixed padded microbatches of
+`inverse_fm_batch_size=32` to bound Jacobian memory, independent of augmentation
+count. This adds Jacobian/line-search work; it does not promise the same insertion
+latency as Picard. Critic updates only read the cached latents. Non-finite outputs
+still raise before replay insertion (invalid source data/parameters are not
+silently accepted). New runs recompute caches; old cached latents are not repaired
+by changing the solver. `critic/aug_z_delta_rms` and
+`critic/aug_z_unchanged_fraction` expose augmentation displacement and rejected or
+unchanged solutions alongside the loss.
+One augmentation keeps the reverse-flow batch at replay batch size;
 larger `aug_z_num` increases cache memory, insertion-time inversion and training
 critic evaluation cost linearly.
 This requires `noise_chunk_length=-1`. Log `critic/td_loss`, `critic/aug_z_loss`

@@ -136,25 +136,45 @@ class IndependentQTests(unittest.TestCase):
 
 
 class AugmentedZTests(unittest.TestCase):
-    def test_gaussian_augmentation_and_grace_inverse(self):
-        class ConstantFlow:
-            def select(self, name):
-                return lambda obs, x, t: jnp.ones_like(x) * .2
+    def test_gaussian_augmentation_and_safeguarded_inverse(self):
         dummy = SimpleNamespace(
-            config=dict(flow_steps=4, aug_z_num=3, aug_z_sigma=.02),
-            bc_flow_network=ConstantFlow())
-        dummy.inverse_fm_batch = lambda obs, a: JGCWAgent.inverse_fm_batch.__wrapped__(dummy, obs, a)
+            config=dict(flow_steps=4, aug_z_num=3, aug_z_sigma=.02,
+                        inverse_fm_radius=10., inverse_fm_batch_size=4),
+            bc_flow_network=SimpleNamespace(select=lambda name: lambda obs, x, t: jnp.ones_like(x) * .2))
+        dummy.inverse_fm_batch = lambda *args: JGCWAgent.inverse_fm_batch.__wrapped__(dummy, *args)
         obs = jnp.zeros((2, 3))
-        actions = jnp.full((2, 8), .999)
+        actions = jnp.full((2, 8), .4)
         key = jax.random.PRNGKey(13)
         actual = JGCWAgent.augment_z.__wrapped__(dummy, obs, actions, key)
         perturbed = actions[:, None, :] + .02 * jax.random.normal(key, (2, 3, 8))
-        self.assertGreater(float(perturbed.max()), 1.)
         np.testing.assert_allclose(actual, perturbed - .2, atol=1e-6)
-        from ogpo.agents.grace import GRACEAgent
-        np.testing.assert_array_equal(
-            dummy.inverse_fm_batch(obs, actions),
-            GRACEAgent.inverse_fm_batch.__wrapped__(dummy, obs, actions))
+
+    def test_inverse_handles_noncontractive_discrete_flow(self):
+        # Picard x <- y - 2*x diverges; the discrete map is still invertible.
+        dummy = SimpleNamespace(config=dict(flow_steps=1, inverse_fm_iterations=16),
+            bc_flow_network=SimpleNamespace(select=lambda name: lambda obs, x, t: 2*x + t))
+        obs = jnp.zeros((3, 1))
+        latents = jnp.linspace(-.1, .1, 24).reshape(3, 8)
+        recovered = JGCWAgent.inverse_fm_batch.__wrapped__(dummy, obs, 3*latents)
+        np.testing.assert_allclose(recovered, latents, atol=1e-6)
+
+    def test_inverse_bounds_unreachable_targets_and_preserves_zero_noise(self):
+        dummy = SimpleNamespace(config=dict(flow_steps=2, inverse_fm_iterations=16),
+            bc_flow_network=SimpleNamespace(select=lambda name: lambda obs, x, t: .2*x + t))
+        obs = jnp.zeros((2, 1))
+        anchor = jnp.full((2, 3), .2)
+        def decode(z):
+            return jnp.clip((z * 1.1) * 1.1 + .25, -1, 1)
+        exact = decode(anchor)
+        recovered = JGCWAgent.inverse_fm_batch.__wrapped__(dummy, obs, exact, anchor)
+        np.testing.assert_allclose(recovered, anchor, atol=1e-6)
+        target = jnp.full_like(exact, 2.)
+        recovered = JGCWAgent.inverse_fm_batch.__wrapped__(dummy, obs, target, anchor)
+        self.assertTrue(np.isfinite(recovered).all())
+        self.assertTrue(np.all(np.abs(recovered) <= 1.))
+        self.assertTrue(np.all(np.linalg.norm(recovered-anchor, axis=-1) <= .500001))
+        self.assertTrue(np.all(np.linalg.norm(decode(recovered)-target, axis=-1)
+                               <= np.linalg.norm(exact-target, axis=-1)))
 
     def test_loss_and_gradient_match_detached_original_q(self):
         agent = make_agent(False)
@@ -216,11 +236,11 @@ class AugmentedZTests(unittest.TestCase):
 
     def test_cache_padding_order_and_independent_batches(self):
         calls = []
-        def augment(obs, actions, rng):
+        def augment(obs, actions, rng, anchors):
             calls.append((np.asarray(obs), np.asarray(actions), np.asarray(rng)))
             return actions[:, None, :] + obs[:, None, :1]
         dummy = SimpleNamespace(augment_z=augment)
-        transitions = [dict(observations=np.full(3, i), true_actions=np.full(8, i * 10.))
+        transitions = [dict(observations=np.full(3, i), true_actions=np.full(8, i * 10.), actions=np.zeros(8))
                        for i in range(5)]
         _cache_augmented_latents(dummy, transitions, jax.random.PRNGKey(20), 2)
         self.assertEqual(len(calls), 3)
@@ -234,6 +254,14 @@ class AugmentedZTests(unittest.TestCase):
         for i, transition in enumerate(transitions):
             np.testing.assert_array_equal(transition['z_aug'], np.full((1, 8), i * 11.))
             self.assertEqual(transition['z_aug'].dtype, np.float32)
+
+    def test_cache_rejects_nonfinite_inverse_before_insertion(self):
+        transitions = [dict(observations=np.zeros(3), true_actions=np.zeros(8), actions=np.zeros(8))]
+        for invalid in (float('nan'), float('inf')):
+            dummy = SimpleNamespace(augment_z=lambda obs, actions, rng, anchors: np.full((2, 1, 8), invalid))
+            with self.assertRaisesRegex(FloatingPointError, 'non-finite z_aug'):
+                _cache_augmented_latents(dummy, transitions, jax.random.PRNGKey(1), 2)
+            self.assertNotIn('z_aug', transitions[0])
 
     def test_runner_caches_once_and_preserves_replay_alignment(self):
         import pickle
@@ -255,8 +283,8 @@ class AugmentedZTests(unittest.TestCase):
                                  rewards=np.zeros(10), terminals=np.zeros(10), masks=np.ones(10))
         cached = []
         original = JGCWAgent.augment_z
-        def record(current, obs, actions, rng):
-            z = original(current, obs, actions, rng)
+        def record(current, obs, actions, rng, anchors):
+            z = original(current, obs, actions, rng, anchors)
             cached.append((np.asarray(obs), np.asarray(actions), np.asarray(z)))
             return z
         with tempfile.TemporaryDirectory() as directory, patch.object(
@@ -294,7 +322,13 @@ class AugmentedZTests(unittest.TestCase):
 
     def test_invalid_augmentation_config(self):
         base = dict(make_agent(False).config)
-        for options, error in [({'aug_z_num': 0}, 'aug_z_num'),
+        for options, error in [({'inverse_fm_radius': 0}, 'inverse_fm_radius'),
+                               ({'inverse_fm_radius': float('nan')}, 'inverse_fm_radius'),
+                               ({'inverse_fm_batch_size': 0}, 'inverse_fm_batch_size'),
+                               ({'inverse_fm_iterations': 0}, 'inverse_fm_iterations'),
+                               ({'inverse_fm_iterations': 1.5}, 'inverse_fm_iterations'),
+                               ({'inverse_fm_iterations': True}, 'inverse_fm_iterations'),
+                               ({'aug_z_num': 0}, 'aug_z_num'),
                                ({'aug_z_num': 1.5}, 'aug_z_num'),
                                ({'aug_z_num': True}, 'aug_z_num'),
                                ({'aug_z_sigma': -.1}, 'aug_z_sigma'),

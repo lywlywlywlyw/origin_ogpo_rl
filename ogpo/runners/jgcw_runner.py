@@ -77,7 +77,12 @@ def _cache_augmented_latents(agent, transitions, rng, batch_size):
         observations = jnp.asarray(np.stack([t['observations'] for t in padded]), dtype=jnp.float32)
         actions = jnp.asarray(np.stack([t['true_actions'] for t in padded]), dtype=jnp.float32)
         latents = np.asarray(agent.augment_z(
-            observations, actions, jax.random.fold_in(rng, start)), dtype=np.float32)
+            observations, actions, jax.random.fold_in(rng, start),
+            jnp.asarray(np.stack([t['actions'] for t in padded]), dtype=jnp.float32)), dtype=np.float32)
+        if not np.isfinite(latents[:count]).all():
+            raise FloatingPointError(
+                'Inverse produced non-finite z_aug before replay insertion; '
+                'check source latents and frozen decoder parameters')
         for transition, z_aug in zip(block, latents[:count]):
             transition['z_aug'] = z_aug
 

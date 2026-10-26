@@ -16,30 +16,85 @@ class JGCWAgent(DSRLBestOfNAgent):
     action_critic_network: Any = None
 
     @jax.jit
-    def inverse_fm_batch(self, observations, actions):
-        """GRACE's reverse Euler integration, without constraining recovered z."""
+    def inverse_fm_batch(self, observations, actions, initial_latents=None):
+        """Solve the *executed discrete decoder* inverse with safeguarded LM.
+
+        Plain UniSteer Picard iteration requires dt*L < 1, which our frozen
+        decoder need not satisfy. Solve the reconstruction least-squares problem
+        instead, including final clipping. Replay z provides the known local
+        branch. Unreachable noisy actions receive a bounded best approximation.
+        """
         if observations.shape[0] != actions.shape[0] or actions.ndim != 2:
             raise ValueError('Inverse FM expects equally sized observation/action batches')
+        initial = jnp.zeros_like(actions) if initial_latents is None else initial_latents
+        if initial.shape != actions.shape:
+            raise ValueError('Inverse initial latents must match the action batch shape')
         steps = self.config['flow_steps']
+        iterations = self.config.get('inverse_fm_iterations', 16)
+        radius = self.config.get('inverse_fm_radius', 0.5)
+        velocity = self.bc_flow_network.select('actor_bc_flow')
 
-        def step(x, i):
-            t = jnp.full((x.shape[0], 1), 1. - i / steps)
-            velocity = self.bc_flow_network.select('actor_bc_flow')(observations, x, t)
-            return x - velocity / steps, None
+        def decode_one(obs, z):
+            def step(x, i):
+                t = jnp.full((1, 1), i / steps)
+                return x + velocity(obs[None], x[None], t)[0] / steps, None
+            raw = jax.lax.scan(step, z, jnp.arange(steps))[0]
+            return jnp.clip(raw, -1., 1.)
 
-        return jax.lax.scan(step, actions, jnp.arange(steps))[0]
+        decode = jax.vmap(decode_one)
+        jacobian = jax.vmap(jax.jacfwd(decode_one, argnums=1))
+        # Actor support is [-1,1]. Include the anchor even for external diagnostic
+        # callers supplying an out-of-support z, preserving the no-worse guarantee.
+        lower, upper = jnp.minimum(initial, -1.), jnp.maximum(initial, 1.)
+
+        def refine(_, x):
+            residual = decode(observations, x) - actions
+            jac = jacobian(observations, x)
+            jt = jnp.swapaxes(jac, -1, -2)
+            delta = jnp.linalg.solve(
+                jt @ jac + 1e-3 * jnp.eye(actions.shape[-1]),
+                jt @ residual[..., None])[..., 0]
+            delta /= jnp.maximum(1., jnp.linalg.norm(delta, axis=-1, keepdims=True) / .25)
+
+            def search(k, best):
+                best_x, best_error = best
+                candidate = jnp.clip(x - (0.5 ** k) * delta, lower, upper)
+                offset = candidate - initial
+                candidate = initial + offset / jnp.maximum(
+                    1., jnp.linalg.norm(offset, axis=-1, keepdims=True) / radius)
+                error = jnp.sum(jnp.square(decode(observations, candidate) - actions), axis=-1)
+                accept = jnp.isfinite(error) & (error < best_error)
+                return (jnp.where(accept[:, None], candidate, best_x),
+                        jnp.where(accept, error, best_error))
+
+            # Rejected/nonfinite trials never replace the last finite iterate.
+            return jax.lax.fori_loop(0, 6, search,
+                                    (x, jnp.sum(jnp.square(residual), axis=-1)))[0]
+
+        return jax.lax.stop_gradient(jax.lax.fori_loop(0, iterations, refine, initial))
 
     @jax.jit
-    def augment_z(self, observations, actions, rng):
-        """Perturb replay action chunks and invert all B*N samples together."""
+    def augment_z(self, observations, actions, rng, initial_latents=None):
+        """Perturb chunks once; invert in fixed microbatches to bound AD memory."""
         count = self.config['aug_z_num']
         noise = jax.random.normal(
             rng, (actions.shape[0], count, actions.shape[-1]), dtype=actions.dtype)
-        # Preserve the requested Gaussian perturbation, including near action bounds.
         augmented = actions[:, None, :] + self.config['aug_z_sigma'] * noise
+        anchors = jnp.zeros_like(actions) if initial_latents is None else initial_latents
         repeated_obs = jnp.repeat(observations, count, axis=0)
-        latents = self.inverse_fm_batch(
-            repeated_obs, augmented.reshape(-1, actions.shape[-1]))
+        targets = augmented.reshape(-1, actions.shape[-1])
+        anchors = jnp.repeat(anchors, count, axis=0)
+        size = self.config.get('inverse_fm_batch_size', 32)
+        padding = (-targets.shape[0]) % size
+
+        def blocks(x):
+            x = jnp.pad(x, ((0, padding),) + ((0, 0),) * (x.ndim - 1), mode='edge')
+            return x.reshape((-1, size) + x.shape[1:])
+
+        latents = jax.lax.map(
+            lambda block: self.inverse_fm_batch(*block),
+            (blocks(repeated_obs), blocks(targets), blocks(anchors)))
+        latents = latents.reshape(-1, actions.shape[-1])[:targets.shape[0]]
         return jax.lax.stop_gradient(latents.reshape(actions.shape[0], count, -1))
 
     def critic_loss(self, batch, grad_params, rng):
@@ -65,7 +120,11 @@ class JGCWAgent(DSRLBestOfNAgent):
         consistency_loss = jnp.mean(jnp.square(q_aug - jax.lax.stop_gradient(q)[..., None]))
         total_loss = td_loss + consistency_loss
         return total_loss, {**info, 'td_loss': td_loss,
-                            'aug_z_loss': consistency_loss, 'critic_loss': total_loss}
+                            'aug_z_loss': consistency_loss, 'critic_loss': total_loss,
+                            'aug_z_delta_rms': jnp.sqrt(jnp.mean(jnp.square(
+                                z_aug - batch['actions'][:, None, :]))),
+                            'aug_z_unchanged_fraction': jnp.mean(jnp.all(
+                                z_aug == batch['actions'][:, None, :], axis=-1))}
 
     def action_critic_loss(self, batch, grad_params, rng):
         # Match DSRL's next latent sample and TD convention exactly.
@@ -128,6 +187,19 @@ class JGCWAgent(DSRLBestOfNAgent):
     @classmethod
     def create(cls, seed, ex_observations, ex_actions, config):
         config = dict(config)
+        config.setdefault('inverse_fm_iterations', 16)
+        config.setdefault('inverse_fm_radius', 0.5)
+        config.setdefault('inverse_fm_batch_size', 32)
+        radius = config['inverse_fm_radius']
+        if (isinstance(radius, bool) or not isinstance(radius, (int, float))
+                or not math.isfinite(radius) or radius <= 0):
+            raise ValueError('inverse_fm_radius must be finite and positive')
+        size = config['inverse_fm_batch_size']
+        if isinstance(size, bool) or not isinstance(size, int) or size < 1:
+            raise ValueError('inverse_fm_batch_size must be a positive integer')
+        iterations = config['inverse_fm_iterations']
+        if isinstance(iterations, bool) or not isinstance(iterations, int) or iterations < 1:
+            raise ValueError('inverse_fm_iterations must be a positive integer')
         config.setdefault('use_aug_z', False)
         config.setdefault('aug_z_num', 1)
         config.setdefault('aug_z_sigma', 0.02)
