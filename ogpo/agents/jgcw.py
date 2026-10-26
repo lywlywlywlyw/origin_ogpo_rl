@@ -29,6 +29,7 @@ class JGCWAgent(DSRLBestOfNAgent):
 
         return jax.lax.scan(step, actions, jnp.arange(steps))[0]
 
+    @jax.jit
     def augment_z(self, observations, actions, rng):
         """Perturb replay action chunks and invert all B*N samples together."""
         count = self.config['aug_z_num']
@@ -46,10 +47,14 @@ class JGCWAgent(DSRLBestOfNAgent):
         if not self.config.get('use_aug_z', False):
             return td_loss, info
 
-        # Derive an independent key without changing DSRL's TD/actor RNG streams.
-        z_aug = self.augment_z(
-            batch['observations'], batch['true_actions'], jax.random.fold_in(rng, 918))
+        if 'z_aug' not in batch:
+            raise ValueError('use_aug_z requires cached z_aug in the replay batch')
+        # Inversion happens once before insertion; Q values remain live predictions.
+        z_aug = jax.lax.stop_gradient(batch['z_aug'])
         count = self.config['aug_z_num']
+        expected_shape = (batch['actions'].shape[0], count, batch['actions'].shape[-1])
+        if z_aug.shape != expected_shape:
+            raise ValueError(f'Cached z_aug shape {z_aug.shape} != {expected_shape}')
         q_aug = self.critic_network.select('critic')(
             jnp.repeat(batch['observations'], count, axis=0),
             actions=z_aug.reshape(-1, z_aug.shape[-1]), params=grad_params)

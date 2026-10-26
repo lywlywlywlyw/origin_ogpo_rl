@@ -67,6 +67,21 @@ def _sample_success_chunks(replay_buffer, batch_size):
     return replay_buffer.sample(batch_size, idxs=indices)
 
 
+def _cache_augmented_latents(agent, transitions, rng, batch_size):
+    """Attach fixed augmentations before insertion, with one padded JIT batch shape."""
+    for start in range(0, len(transitions), batch_size):
+        block = transitions[start:start + batch_size]
+        count = len(block)
+        # Repeating the last transition only pads compute; padded outputs are discarded.
+        padded = block + [block[-1]] * (batch_size - count)
+        observations = jnp.asarray(np.stack([t['observations'] for t in padded]), dtype=jnp.float32)
+        actions = jnp.asarray(np.stack([t['true_actions'] for t in padded]), dtype=jnp.float32)
+        latents = np.asarray(agent.augment_z(
+            observations, actions, jax.random.fold_in(rng, start)), dtype=np.float32)
+        for transition, z_aug in zip(block, latents[:count]):
+            transition['z_aug'] = z_aug
+
+
 def _run_jgcw_online_rl(
     agent: Any,
     env: Any,
@@ -148,9 +163,14 @@ def _run_jgcw_online_rl(
         raise ValueError(f'Unknown chunk reward aggregation: {reward_aggregation}')
 
     is_dsrl_expo = (algo_name == 'dsrl_plus_expo')
+    use_aug_z = config.get('use_aug_z', False)
+    augmentation_rng = jax.random.fold_in(jax.random.PRNGKey(seed + 50000), resumed_online_step)
 
     if is_resumed and resumed_replay_buffer is not None:
         replay_buffer = resumed_replay_buffer
+        if use_aug_z and ('z_aug' not in replay_buffer or replay_buffer['z_aug'].shape[1:] != (
+                config['aug_z_num'], noise_dim)):
+            raise ValueError('Resumed replay must contain matching cached z_aug when use_aug_z=true')
     else:
         example_noise = np.zeros((noise_dim,))
         example_true_actions = np.zeros((action_dim * horizon_length,))
@@ -164,6 +184,8 @@ def _run_jgcw_online_rl(
             masks=np.array(1.0),
             next_observations=example_batch['observations'],
         )
+        if use_aug_z:
+            example_transition['z_aug'] = np.zeros((config['aug_z_num'], noise_dim), dtype=np.float32)
         if reward_aggregation == 'discounted_sum':
             example_transition['chunk_length'] = np.array(horizon_length)
         if is_dsrl_expo:
@@ -317,6 +339,10 @@ def _run_jgcw_online_rl(
             trajectory_buffer.append(transition)
 
             if done:
+                if use_aug_z:
+                    _cache_augmented_latents(
+                        agent, trajectory_buffer,
+                        jax.random.fold_in(augmentation_rng, episode_counter), batch_size)
                 is_success = float(info.get('success', 0.0))
                 score = is_success if is_success != 0 else 1e-9
                 for traj_transition in trajectory_buffer:

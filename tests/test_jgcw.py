@@ -14,7 +14,9 @@ import numpy as np
 
 from ogpo.agents.dsrl import DSRLBestOfNAgent
 from ogpo.agents.jgcw import JGCWAgent
-from ogpo.runners.jgcw_runner import run_jgcw_online_rl
+from ogpo.runners.jgcw_runner import (
+    run_jgcw_online_rl, _cache_augmented_latents, _sample_success_chunks,
+)
 from ogpo.utils.action_coverage import ActionCoverage
 from ogpo.utils.config_loader import load_config, config_to_agent_dict
 from ogpo.utils.datasets import Dataset
@@ -145,7 +147,7 @@ class AugmentedZTests(unittest.TestCase):
         obs = jnp.zeros((2, 3))
         actions = jnp.full((2, 8), .999)
         key = jax.random.PRNGKey(13)
-        actual = JGCWAgent.augment_z(dummy, obs, actions, key)
+        actual = JGCWAgent.augment_z.__wrapped__(dummy, obs, actions, key)
         perturbed = actions[:, None, :] + .02 * jax.random.normal(key, (2, 3, 8))
         self.assertGreater(float(perturbed.max()), 1.)
         np.testing.assert_allclose(actual, perturbed - .2, atol=1e-6)
@@ -162,6 +164,7 @@ class AugmentedZTests(unittest.TestCase):
         z = agent.augment_z(batch['observations'], batch['true_actions'],
                             jax.random.fold_in(key, 918))
         self.assertEqual(z.shape, (3, 2, 8))
+        batch['z_aug'] = z
         q = agent.critic_network.select('critic')(
             batch['observations'], actions=batch['actions'])
         def expected_loss(params):
@@ -184,11 +187,15 @@ class AugmentedZTests(unittest.TestCase):
         initial = make_agent(False)
         initial = initial.replace(config=dict(initial.config, use_aug_z=True))
         batch = jax.tree.map(lambda x: x[:1], make_batch())
+        obs, actions = batch['observations'][0], batch['true_actions'][0]
+        batch['z_aug'] = initial.augment_z(obs, actions, jax.random.PRNGKey(17))[None]
         success_batch = dict(batch, true_actions=batch['true_actions'] + .1,
-                             rewards=batch['rewards'] + .5)
+                             rewards=batch['rewards'] + .5,
+                             z_aug=initial.augment_z(obs, actions + .1, jax.random.PRNGKey(18))[None])
         for success in (None, False, True):
             replay_success = success_batch if success is not None else None
-            updated, info = initial.batch_update(batch, replay_success, bool(success))
+            with patch.object(JGCWAgent, 'augment_z', side_effect=AssertionError('Training must use cache')):
+                updated, info = initial.batch_update(batch, replay_success, bool(success))
             self.assertEqual(int(updated.critic_network.step),
                              int(initial.critic_network.step) + 2)
             self.assertTrue(np.isfinite(info['critic/aug_z_loss']))
@@ -206,6 +213,84 @@ class AugmentedZTests(unittest.TestCase):
             # Fused scan and standalone updates may differ by float32 rounding.
             for x, y in zip(jax.tree.leaves(updated.critic_network), jax.tree.leaves(state)):
                 np.testing.assert_allclose(x, y, atol=1e-6, rtol=1e-5)
+
+    def test_cache_padding_order_and_independent_batches(self):
+        calls = []
+        def augment(obs, actions, rng):
+            calls.append((np.asarray(obs), np.asarray(actions), np.asarray(rng)))
+            return actions[:, None, :] + obs[:, None, :1]
+        dummy = SimpleNamespace(augment_z=augment)
+        transitions = [dict(observations=np.full(3, i), true_actions=np.full(8, i * 10.))
+                       for i in range(5)]
+        _cache_augmented_latents(dummy, transitions, jax.random.PRNGKey(20), 2)
+        self.assertEqual(len(calls), 3)
+        for obs, actions, _ in calls:
+            self.assertEqual(obs.shape, (2, 3))
+            self.assertEqual(actions.shape, (2, 8))
+            self.assertEqual(obs.dtype, np.float32)
+        self.assertFalse(np.array_equal(calls[0][2], calls[1][2]))
+        np.testing.assert_array_equal(calls[-1][0][0], calls[-1][0][1])
+        self.assertEqual(len(transitions), 5)
+        for i, transition in enumerate(transitions):
+            np.testing.assert_array_equal(transition['z_aug'], np.full((1, 8), i * 11.))
+            self.assertEqual(transition['z_aug'].dtype, np.float32)
+
+    def test_runner_caches_once_and_preserves_replay_alignment(self):
+        import pickle
+        agent = make_agent(False)
+        config = dict(agent.config, use_aug_z=True, aug_z_num=2, updates_per_env_step=False)
+        agent = agent.replace(config=config)
+        class Env:
+            def reset(self, seed):
+                self.episode = getattr(self, 'episode', 0) + 1
+                self.t = 0
+                return np.array([self.episode, self.t, 0], dtype=np.float32), {}
+            def step(self, action):
+                self.t += 1
+                return (np.array([self.episode, self.t, 0], dtype=np.float32),
+                        -1., self.t == 9, False, {'success': 1.})
+        dataset = Dataset.create(observations=np.zeros((10, 3), dtype=np.float32),
+                                 actions=np.zeros((10, 2), dtype=np.float32),
+                                 next_observations=np.zeros((10, 3), dtype=np.float32),
+                                 rewards=np.zeros(10), terminals=np.zeros(10), masks=np.ones(10))
+        cached = []
+        original = JGCWAgent.augment_z
+        def record(current, obs, actions, rng):
+            z = original(current, obs, actions, rng)
+            cached.append((np.asarray(obs), np.asarray(actions), np.asarray(z)))
+            return z
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+                JGCWAgent, 'augment_z', record), patch('ogpo.runners.jgcw_runner.save_agent'), patch(
+                'ogpo.runners.jgcw_runner._run_evaluation', return_value={}):
+            updated, step, _, replay = run_jgcw_online_rl(
+                agent, Env(), None, None, dataset, config, SimpleNamespace(log=lambda *a, **kw: None),
+                directory, 'jgcw', online_steps=18, start_training=9, batch_size=3,
+                horizon_length=4, discount=.99, n_eval_envs=1, log_interval=-1,
+                eval_interval=-1, save_interval=-1, buffer_size=5,
+                use_success_buffer=True, success_buffer_batch_size=3)
+        self.assertEqual(step, 18)
+        self.assertEqual(int(updated.critic_network.step), int(agent.critic_network.step) + 6)
+        self.assertEqual(len(cached), 2)  # One insertion batch per episode; none in training.
+        self.assertEqual(replay.size, 5)  # Six chunks exercise ring-buffer overwrite.
+        expected = {tuple(obs): (action, z) for observations, actions, latents in cached
+                    for obs, action, z in zip(observations, actions, latents)}
+        for sampled in (replay.sample(12), _sample_success_chunks(replay, 12),
+                        pickle.loads(pickle.dumps(replay)).sample(12)):
+            for obs, action, z in zip(sampled['observations'], sampled['true_actions'], sampled['z_aug']):
+                expected_action, expected_z = expected[tuple(obs)]
+                np.testing.assert_array_equal(action, expected_action)
+                np.testing.assert_array_equal(z, expected_z)
+        assert_equal(self, agent.bc_flow_network, updated.bc_flow_network)
+
+    def test_enabled_loss_requires_cache(self):
+        agent = make_agent(False)
+        agent = agent.replace(config=dict(agent.config, use_aug_z=True))
+        batch = jax.tree.map(lambda x: x[0], make_batch())
+        with self.assertRaisesRegex(ValueError, 'cached z_aug'):
+            agent.critic_loss(batch, agent.critic_network.params, jax.random.PRNGKey(1))
+        batch['z_aug'] = jnp.zeros((3, 2, 8))
+        with self.assertRaisesRegex(ValueError, 'shape'):
+            agent.critic_loss(batch, agent.critic_network.params, jax.random.PRNGKey(1))
 
     def test_invalid_augmentation_config(self):
         base = dict(make_agent(False).config)

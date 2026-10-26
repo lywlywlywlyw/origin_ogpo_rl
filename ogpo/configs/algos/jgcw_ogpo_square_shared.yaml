@@ -6,9 +6,9 @@ experiment:
 agent:
   agent_name: jgcw
   # Q(s,z) always learns its own TD target. Q(s,a) is an independent diagnostic.
-  # Local action perturbations -> reverse-flow latents -> Q consistency loss.
+  # Cache reverse-flow latents at episode insertion; reuse them for Q consistency.
   use_aug_z: true
-  aug_z_num: 1              # one extra sample per replay chunk; batched inverse
+  aug_z_num: 5              # one cached sample per replay chunk; fixed-batch inverse
   aug_z_sigma: 0.02         # per-coordinate Gaussian standard deviation
   train_q_sa: false
   cal_q_accuracy: false

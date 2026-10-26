@@ -26,16 +26,27 @@ training directly.
 
 Q(s,z) learns its own TD target and controls the actor. With `use_aug_z=false`,
 its updates match DSRL exactly. Square defaults to `use_aug_z=true`,
-`aug_z_num=1`, and `aug_z_sigma=0.02`. For every latent critic update (including
-extra success-buffer updates), add independent N(0, sigma²) noise to each replay
-action chunk, invert the augmented actions with GRACE's reverse Euler method,
-and add `mean((Q(s,z_aug) - stop_gradient(Q(s,z)))²)` to the TD loss with unit
-weight. The loss averages over samples, augmentations and ensemble members.
+`aug_z_num=1`, and `aug_z_sigma=0.02`. At episode completion, before inserting
+transitions into replay, add independent N(0, sigma²) noise to each action chunk
+and invert the augmented actions with GRACE's reverse Euler method. Cache
+`z_aug` as float32 with shape `(aug_z_num, noise_dim)` per transition. Inversion
+uses fixed batches of `batch_size` transitions, padding the final batch and
+discarding padded outputs, to avoid compilation for different episode lengths.
+A separate RNG stream leaves actor sampling and TD RNG streams unchanged.
+
+Every latent critic update (including extra success-buffer updates) reads the
+cached latents and adds `mean((Q(s,z_aug) - stop_gradient(Q(s,z)))²)` to the TD
+loss with unit weight. Q values are recomputed on each update, while the same
+transition reuses its fixed augmentations rather than drawing fresh noise.
+Ordinary and success replay sampling both preserve the cached field. Training
+never runs the inverse decoder; a missing or incompatible cache raises an error.
+The loss averages over samples, augmentations and ensemble members.
 Actions and recovered latents are not clipped. The frozen decoder and actor do
 not receive gradients from this loss. Inversion is approximate because Euler
 integration and the forward decoder's final action clipping are not exactly
-invertible. One augmentation keeps the extra reverse-flow batch at replay batch
-size; larger `aug_z_num` increases inversion and critic evaluation cost linearly.
+invertible. One augmentation keeps the reverse-flow batch at replay batch size;
+larger `aug_z_num` increases cache memory, insertion-time inversion and training
+critic evaluation cost linearly.
 This requires `noise_chunk_length=-1`. Log `critic/td_loss`, `critic/aug_z_loss`
 and their sum `critic/critic_loss` under `online_agent`. `train_q_sa` additionally trains a separate action-space TD critic with
 the same architecture, optimizer and replay minibatches. It has its own target
