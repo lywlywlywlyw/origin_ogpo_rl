@@ -60,6 +60,8 @@ def _reshape_for_utd(batch, utd_ratio, batch_size):
 
 def _sample_success_chunks(replay_buffer, batch_size):
     """Sample with replacement, like OGPO sample_sequence(success_only=True)."""
+    if hasattr(replay_buffer, 'sample_success_chunks'):
+        return replay_buffer.sample_success_chunks(batch_size)
     candidates = np.flatnonzero(replay_buffer._traj_success_mask[:replay_buffer.size])
     if not len(candidates):
         raise ValueError('No successful transitions available')
@@ -140,6 +142,7 @@ def _run_jgcw_online_rl(
     mc_regression: bool = False,
     mesh=None,
     accuracy=None,
+    augmentation_resources=None,
 ) -> Tuple[Any, int, Dict, ReplayBuffer]:
     """Online RL runner for JGCW. Stores chunk-level transitions with
     noise as 'actions' and denoised actions as 'true_actions'."""
@@ -169,13 +172,28 @@ def _run_jgcw_online_rl(
 
     is_dsrl_expo = (algo_name == 'dsrl_plus_expo')
     use_aug_z = config.get('use_aug_z', False)
-    augmentation_rng = jax.random.fold_in(jax.random.PRNGKey(seed + 50000), resumed_online_step)
+
+    augmentation = None
+
+    def _start_augmentation(example, initial=None):
+        from ogpo.utils.jgcw_augmentation import AsyncAugmentationReplay
+        nonlocal augmentation
+        augmentation = AsyncAugmentationReplay(
+            agent, example, buffer_size, seed, config,
+            resumed_step=resumed_online_step, initial=initial)
+        if augmentation_resources is not None:
+            augmentation_resources.append(augmentation)
+        return augmentation.replay
 
     if is_resumed and resumed_replay_buffer is not None:
         replay_buffer = resumed_replay_buffer
         if use_aug_z and ('z_aug' not in replay_buffer or replay_buffer['z_aug'].shape[1:] != (
                 config['aug_z_num'], noise_dim)):
             raise ValueError('Resumed replay must contain matching cached z_aug when use_aug_z=true')
+        if use_aug_z:
+            replay_buffer = _start_augmentation(
+                {key: np.zeros(value.shape[1:], value.dtype)
+                 for key, value in replay_buffer.items()}, replay_buffer)
     else:
         example_noise = np.zeros((noise_dim,))
         example_true_actions = np.zeros((action_dim * horizon_length,))
@@ -197,9 +215,12 @@ def _run_jgcw_online_rl(
             example_transition['refined_actions'] = example_true_actions.copy()
             example_transition['base_actions'] = example_true_actions.copy()
 
-        replay_buffer = ReplayBuffer.create(
-            example_transition, buffer_size,
-            numpy_rng=np.random.default_rng(seed + 30000))
+        if use_aug_z:
+            replay_buffer = _start_augmentation(example_transition)
+        else:
+            replay_buffer = ReplayBuffer.create(
+                example_transition, buffer_size,
+                numpy_rng=np.random.default_rng(seed + 30000))
 
     if p_aug is not None:
         replay_buffer.p_aug = p_aug
@@ -244,6 +265,7 @@ def _run_jgcw_online_rl(
     gradient_updates = 0
     critic_gradient_updates = 0
     episode_counter = 0
+    episode_chunk = 0
     update_info = {}
     online_rng = jax.random.PRNGKey(seed + 40000)
     eval_flags = _build_eval_flags(n_eval_envs, eval_episodes, discount, run_name, env_name)
@@ -259,6 +281,8 @@ def _run_jgcw_online_rl(
 
     with tqdm.tqdm(total=online_steps, initial=total_env_step, desc="JGCW Online RL", dynamic_ncols=True) as pbar:
         while total_env_step < online_steps:
+            if augmentation is not None:
+                augmentation.check()
             if accuracy is not None:
                 accuracy.poll(logger, log_step)
                 if total_env_step >= accuracy_next_step and accuracy.submit(agent, total_env_step):
@@ -341,23 +365,27 @@ def _run_jgcw_online_rl(
                 transition['refined_actions'] = current_true_actions
                 transition['base_actions'] = current_base_actions
 
-            trajectory_buffer.append(transition)
+            if augmentation is not None:
+                augmentation.submit(transition, episode_counter, episode_chunk)
+                episode_chunk += 1
+            else:
+                trajectory_buffer.append(transition)
 
             if done:
-                if use_aug_z:
-                    _cache_augmented_latents(
-                        agent, trajectory_buffer,
-                        jax.random.fold_in(augmentation_rng, episode_counter), batch_size)
                 is_success = float(info.get('success', 0.0))
-                score = is_success if is_success != 0 else 1e-9
-                for traj_transition in trajectory_buffer:
-                    if use_success_buffer:
-                        traj_transition['is_success'] = is_success
-                        traj_transition['score'] = score
-                    replay_buffer.add_transition(traj_transition)
+                if augmentation is not None:
+                    augmentation.finish_episode(episode_counter, is_success)
+                else:
+                    score = is_success if is_success != 0 else 1e-9
+                    for traj_transition in trajectory_buffer:
+                        if use_success_buffer:
+                            traj_transition['is_success'] = is_success
+                            traj_transition['score'] = score
+                        replay_buffer.add_transition(traj_transition)
 
                 trajectory_buffer = []
                 episode_counter += 1
+                episode_chunk = 0
                 reset_index = episode_counter if per_env_updates else total_env_step
                 raw_ob, _ = env.reset(seed=seed + 10000 + reset_index)
                 ob = _encode_ob(raw_ob)
@@ -382,6 +410,11 @@ def _run_jgcw_online_rl(
             if utd_ratio == 0:
                 continue
             min_required = batch_size * utd_ratio
+            if augmentation is not None and replay_buffer.size < min_required:
+                # Wait for submitted initial rows, not for each newest transition.
+                # Never discard eligible updates just because the worker is warming up.
+                if augmentation.submitted + augmentation.initial_size >= min_required:
+                    augmentation.wait_for_size(min_required)
             if replay_buffer.size < min_required:
                 if per_env_updates:
                     raise RuntimeError(
@@ -395,13 +428,17 @@ def _run_jgcw_online_rl(
             batch_success = None
             success_flag = False
             if use_success_buffer:
-                num_successful = replay_buffer._traj_success_mask[:replay_buffer.size].sum()
                 min_success_required = success_buffer_batch_size * utd_ratio
+                if augmentation is not None:
+                    num_successful = replay_buffer.success_count(physical=per_env_updates)
+                else:
+                    num_successful = replay_buffer._traj_success_mask[:replay_buffer.size].sum()
+                    if per_env_updates:
+                        lengths = replay_buffer['chunk_length'][:replay_buffer.size]
+                        successful = replay_buffer._traj_success_mask[:replay_buffer.size]
+                        num_successful = lengths[successful].sum()
                 if per_env_updates:
                     # Match OGPO's threshold in physical transitions, not chunks.
-                    lengths = replay_buffer['chunk_length'][:replay_buffer.size]
-                    successful = replay_buffer._traj_success_mask[:replay_buffer.size]
-                    num_successful = lengths[successful].sum()
                     min_success_required = success_buffer_batch_size * utd_online + horizon_length
                 if num_successful >= min_success_required:
                     try:
@@ -432,6 +469,8 @@ def _run_jgcw_online_rl(
                 for key, info_dict in update_info.items():
                     logger.log(info_dict, key, step=log_step)
                 update_info = {}
+                if augmentation is not None:
+                    logger.log(augmentation.metrics(), 'augmentation', step=log_step)
                 logger.log(dict(env_steps=total_env_step, gradient_updates=gradient_updates,
                                 critic_gradient_updates=critic_gradient_updates,
                                 action_critic_gradient_updates=(critic_gradient_updates if config.get('train_q_sa', False) else 0),
@@ -465,9 +504,17 @@ def _run_jgcw_online_rl(
 
             if preemption_backup_interval > 0 and total_env_step % preemption_backup_interval == 0:
                 print(f"Saving rolling checkpoint at env step {total_env_step}")
+                if augmentation is not None:
+                    augmentation.flush()
                 save_rolling_checkpoint(
                     agent, replay_buffer, log_step, total_env_step, seed, env_name,
                     wandb_run_id=wandb_run_id, algo_name=algo_name)
+
+    if augmentation is not None:
+        if episode_chunk:
+            augmentation.finish_episode(episode_counter, info.get('success', 0.))
+        augmentation.flush()
+        logger.log(augmentation.metrics(), 'augmentation', step=log_step)
 
     if per_env_updates and not is_resumed:
         expected = max(0, online_steps - max(0, start_training)) * utd_online
@@ -487,13 +534,15 @@ def _run_jgcw_online_rl(
 
 
 def run_jgcw_online_rl(*args, **kwargs):
-    """Own the evaluator lifecycle, including cleanup after runner exceptions."""
+    """Own augmentation/evaluator workers, including cleanup on exceptions."""
     import inspect
     from ogpo.utils.q_accuracy import AsyncQAccuracy
     bound = inspect.signature(_run_jgcw_online_rl).bind(*args, **kwargs)
     bound.apply_defaults()
     values = bound.arguments
     accuracy = None
+    augmentation_resources = []
+    values['augmentation_resources'] = augmentation_resources
     try:
         if values['config'].get('cal_q_accuracy', False):
             accuracy = AsyncQAccuracy(
@@ -507,5 +556,7 @@ def run_jgcw_online_rl(*args, **kwargs):
             accuracy.finish(result[0], final_online_step, values['logger'], result[1])
         return result
     finally:
+        for augmentation in augmentation_resources:
+            augmentation.close()
         if accuracy is not None:
             accuracy.close()

@@ -56,20 +56,22 @@ class JGCWAgent(DSRLBestOfNAgent):
                 jt @ residual[..., None])[..., 0]
             delta /= jnp.maximum(1., jnp.linalg.norm(delta, axis=-1, keepdims=True) / .25)
 
-            def search(k, best):
-                best_x, best_error = best
-                candidate = jnp.clip(x - (0.5 ** k) * delta, lower, upper)
-                offset = candidate - initial
-                candidate = initial + offset / jnp.maximum(
-                    1., jnp.linalg.norm(offset, axis=-1, keepdims=True) / radius)
-                error = jnp.sum(jnp.square(decode(observations, candidate) - actions), axis=-1)
-                accept = jnp.isfinite(error) & (error < best_error)
-                return (jnp.where(accept[:, None], candidate, best_x),
-                        jnp.where(accept, error, best_error))
-
-            # Rejected/nonfinite trials never replace the last finite iterate.
-            return jax.lax.fori_loop(0, 6, search,
-                                    (x, jnp.sum(jnp.square(residual), axis=-1)))[0]
+            # Evaluate all six line-search candidates in one batched decoder
+            # pass instead of six serial GPU passes. Keep the same best-residual
+            # acceptance rule (including retaining x if every trial is rejected).
+            scales = jnp.power(.5, jnp.arange(6))[:, None, None]
+            candidates = jnp.clip(x[None] - scales * delta[None], lower, upper)
+            offsets = candidates - initial
+            candidates = initial + offsets / jnp.maximum(
+                1., jnp.linalg.norm(offsets, axis=-1, keepdims=True) / radius)
+            decoded = jax.vmap(lambda candidate: decode(observations, candidate))(candidates)
+            errors = jnp.sum(jnp.square(decoded - actions), axis=-1)
+            errors = jnp.where(jnp.isfinite(errors), errors, jnp.inf)
+            winners = jnp.argmin(errors, axis=0)
+            rows = jnp.arange(actions.shape[0])
+            best = candidates[winners, rows]
+            accept = errors[winners, rows] < jnp.sum(jnp.square(residual), axis=-1)
+            return jnp.where(accept[:, None], best, x)
 
         return jax.lax.stop_gradient(jax.lax.fori_loop(0, iterations, refine, initial))
 
@@ -77,14 +79,19 @@ class JGCWAgent(DSRLBestOfNAgent):
     def augment_z(self, observations, actions, rng, initial_latents=None):
         """Perturb chunks once; invert in fixed microbatches to bound AD memory."""
         count = self.config['aug_z_num']
-        noise = jax.random.normal(
-            rng, (actions.shape[0], count, actions.shape[-1]), dtype=actions.dtype)
+        if rng.ndim == 2:
+            noise = jax.vmap(lambda key: jax.random.normal(
+                key, (count, actions.shape[-1]), dtype=actions.dtype))(rng)
+        else:
+            noise = jax.random.normal(
+                rng, (actions.shape[0], count, actions.shape[-1]), dtype=actions.dtype)
         augmented = actions[:, None, :] + self.config['aug_z_sigma'] * noise
         anchors = jnp.zeros_like(actions) if initial_latents is None else initial_latents
         repeated_obs = jnp.repeat(observations, count, axis=0)
         targets = augmented.reshape(-1, actions.shape[-1])
         anchors = jnp.repeat(anchors, count, axis=0)
-        size = self.config.get('inverse_fm_batch_size', 32)
+        size = min(self.config.get('inverse_fm_batch_size', 128),
+                   1 << (targets.shape[0] - 1).bit_length())
         padding = (-targets.shape[0]) % size
 
         def blocks(x):

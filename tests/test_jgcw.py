@@ -98,6 +98,7 @@ class IndependentQTests(unittest.TestCase):
         self.assertFalse(config['train_q_sa'])
         self.assertTrue(config['use_aug_z'])
         self.assertIn('online_budget', training_log_prefixes('jgcw', 100))
+        self.assertIn('augmentation', training_log_prefixes('jgcw', 100))
         config.update(train_q_sa=False, cal_q_accuracy=True)
         with self.assertRaisesRegex(ValueError, 'train_q_sa'):
             JGCWAgent.create(1, jnp.zeros(3), jnp.zeros(2), config)
@@ -281,14 +282,9 @@ class AugmentedZTests(unittest.TestCase):
                                  actions=np.zeros((10, 2), dtype=np.float32),
                                  next_observations=np.zeros((10, 3), dtype=np.float32),
                                  rewards=np.zeros(10), terminals=np.zeros(10), masks=np.ones(10))
-        cached = []
-        original = JGCWAgent.augment_z
-        def record(current, obs, actions, rng, anchors):
-            z = original(current, obs, actions, rng, anchors)
-            cached.append((np.asarray(obs), np.asarray(actions), np.asarray(z)))
-            return z
         with tempfile.TemporaryDirectory() as directory, patch.object(
-                JGCWAgent, 'augment_z', record), patch('ogpo.runners.jgcw_runner.save_agent'), patch(
+                JGCWAgent, 'augment_z', side_effect=AssertionError('Main process must not invert')), patch(
+                'ogpo.runners.jgcw_runner.save_agent'), patch(
                 'ogpo.runners.jgcw_runner._run_evaluation', return_value={}):
             updated, step, _, replay = run_jgcw_online_rl(
                 agent, Env(), None, None, dataset, config, SimpleNamespace(log=lambda *a, **kw: None),
@@ -298,16 +294,18 @@ class AugmentedZTests(unittest.TestCase):
                 use_success_buffer=True, success_buffer_batch_size=3)
         self.assertEqual(step, 18)
         self.assertEqual(int(updated.critic_network.step), int(agent.critic_network.step) + 6)
-        self.assertEqual(len(cached), 2)  # One insertion batch per episode; none in training.
         self.assertEqual(replay.size, 5)  # Six chunks exercise ring-buffer overwrite.
-        expected = {tuple(obs): (action, z) for observations, actions, latents in cached
-                    for obs, action, z in zip(observations, actions, latents)}
+        base_key = jax.random.PRNGKey(50000)
+        base_key = jax.random.fold_in(base_key, 0)
         for sampled in (replay.sample(12), _sample_success_chunks(replay, 12),
                         pickle.loads(pickle.dumps(replay)).sample(12)):
-            for obs, action, z in zip(sampled['observations'], sampled['true_actions'], sampled['z_aug']):
-                expected_action, expected_z = expected[tuple(obs)]
-                np.testing.assert_array_equal(action, expected_action)
-                np.testing.assert_array_equal(z, expected_z)
+            keys = jnp.stack([jax.random.fold_in(jax.random.fold_in(
+                base_key, int(obs[0]) - 1), int(obs[1]) // 4) for obs in sampled['observations']])
+            expected = agent.augment_z(jnp.asarray(sampled['observations'], dtype=jnp.float32),
+                jnp.asarray(sampled['true_actions'], dtype=jnp.float32), keys,
+                jnp.asarray(sampled['actions'], dtype=jnp.float32))
+            np.testing.assert_allclose(sampled['z_aug'], expected, atol=1e-5, rtol=1e-5)
+        replay.close()
         assert_equal(self, agent.bc_flow_network, updated.bc_flow_network)
 
     def test_enabled_loss_requires_cache(self):

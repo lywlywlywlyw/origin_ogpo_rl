@@ -7,9 +7,16 @@ agent:
   agent_name: jgcw
   inverse_fm_iterations: 16  # safeguarded reconstruction solver iterations
   inverse_fm_radius: 0.5     # maximum L2 distance from the original replay latent
-  inverse_fm_batch_size: 32  # fixed inverse microbatch; bounds Jacobian memory
+  inverse_fm_batch_size: 128  # fixed inverse microbatch; bounds Jacobian memory
   # Q(s,z) always learns its own TD target. Q(s,a) is an independent diagnostic.
-  # Cache reverse-flow latents at episode insertion; reuse them for Q consistency.
+  # Augment/invert each completed chunk asynchronously, then publish it to shared replay.
+  # use_aug_z: spawn one frozen-decoder worker; only it writes shared replay.
+  aug_worker_device: auto  # same JAX backend as trainer; cpu or cuda may be explicit
+  aug_worker_cuda_visible_devices: null  # null shares the trainer's visible GPU(s)
+  aug_worker_batch_size: 8  # coalesce queued chunks; bounded power-of-two JIT shapes
+  aug_worker_queue_size: 128  # backpressure, no dropped transitions
+  aug_worker_cpu_count: 4
+  aug_worker_timeout: 600
   use_aug_z: true
   aug_z_num: 50              # cached samples per replay chunk; fixed-batch inverse
   aug_z_sigma: 0.02         # per-coordinate Gaussian standard deviation

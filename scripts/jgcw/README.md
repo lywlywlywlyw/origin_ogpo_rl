@@ -26,14 +26,34 @@ training directly.
 
 Q(s,z) learns its own TD target and controls the actor. With `use_aug_z=false`,
 its updates match DSRL exactly. Square defaults to `use_aug_z=true`,
-`aug_z_num=50`, and `aug_z_sigma=0.02`. At episode completion, before inserting
-transitions into replay, add independent N(0, sigma²) noise to each action chunk
-and invert the augmented actions with UniSteer's per-step fixed-point method
-(Sec. 4.1 and Appendix A.2 of the local UniSteer paper). Cache
-`z_aug` as float32 with shape `(aug_z_num, noise_dim)` per transition. Inversion
-uses fixed batches of `batch_size` transitions, padding the final batch and
-discarding padded outputs, to avoid compilation for different episode lengths.
-A separate RNG stream leaves actor sampling and TD RNG streams unchanged.
+`aug_z_num=50`, and `aug_z_sigma=0.02`. With augmentation enabled, a spawned
+`jgcw-augmentation-writer` process owns the frozen decoder and is the **only**
+replay writer. Each completed action chunk (one transition, up to four physical
+steps) is submitted immediately, without waiting for episode end. The worker
+adds N(0, sigma²) action noise, solves for `z_aug`, and publishes the complete
+transition with float32 `(aug_z_num, noise_dim)` cached latents directly into
+shared memory. The main process does not copy augmented data back over a queue.
+Episode success is attached by the same writer when the outcome becomes known;
+ordinary replay can use complete transitions before then. Final partial episodes
+are retained, and the worker is drained before final return/checkpoint.
+
+Readers and the writer overlap. Each row has a version: odd while being written,
+even when complete. Sampling copies fields without holding the metadata lock,
+then verifies the version; interrupted/overwritten copies retry. A reader never
+uses partially written `(s,z,a,z_aug)` rows. Only short claim/publication and
+version-check operations use the metadata lock; neural training and actual array
+copying run outside it. Returned reader arrays are read-only. Portable rolling
+checkpoints drain the worker, then serialize a normal replay snapshot. Worker
+errors propagate to the main loop; cleanup terminates the worker and unlinks
+shared-memory names even on exceptions.
+
+`aug_worker_batch_size=8` coalesces queued transitions using bounded padded batch
+shapes (1,2,4,8); it never waits to accumulate an episode. `aug_worker_queue_size=128`
+bounds pending work, with backpressure rather than dropped transitions. Per-row
+random keys depend on seed/episode/chunk, so scheduling and padding do not alter
+the Gaussian targets. Initial training waits for enough published rows instead
+of silently dropping the matched update budget; subsequent updates can use older
+published rows while new transitions are being augmented.
 
 Every latent critic update (including extra success-buffer updates) reads the
 cached latents and adds `mean((Q(s,z_aug) - stop_gradient(Q(s,z)))²)` to the TD
@@ -61,17 +81,29 @@ exact inverse. A rejected solve retains the original latent and contributes
 zero consistency loss. Zero perturbation of a correctly paired `(s,z,a)` also
 preserves z. Final clipping is non-injective and noisy targets may be unreachable.
 
-Inversion remains at episode insertion, with fixed padded microbatches of
-`inverse_fm_batch_size=32` to bound Jacobian memory, independent of augmentation
-count. This adds Jacobian/line-search work; it does not promise the same insertion
-latency as Picard. Critic updates only read the cached latents. Non-finite outputs
-still raise before replay insertion (invalid source data/parameters are not
-silently accepted). New runs recompute caches; old cached latents are not repaired
-by changing the solver. `critic/aug_z_delta_rms` and
-`critic/aug_z_unchanged_fraction` expose augmentation displacement and rejected or
-unchanged solutions alongside the loss.
-One augmentation keeps the reverse-flow batch at replay batch size;
-larger `aug_z_num` increases cache memory, insertion-time inversion and training
+The decoder-only worker uses JIT, vectorized Jacobians, and a single batched
+forward evaluation of all six line-search trials rather than six serial decoder
+passes. `inverse_fm_batch_size=128` is the microbatch cap; short tasks use a
+smaller power-of-two size to reduce padding. No actor/critic/optimizer is copied
+to the worker. The numerical objective and acceptance criterion remain the same;
+batched floating-point rounding can change recovered latents slightly.
+Non-finite source data or recovered latents stop the run before publication.
+`critic/aug_z_delta_rms` and `critic/aug_z_unchanged_fraction` expose augmentation
+displacement and rejected/unchanged solves.
+
+`aug_worker_device=auto` uses the trainer's JAX backend. On CUDA it shares visible
+GPUs, with preallocation disabled in the worker. `aug_worker_cuda_visible_devices`
+can select a separate GPU if available; `aug_worker_device=cpu` forces CPU-only
+inversion and `aug_worker_cpu_count=4` limits CPU affinity. Sharing a GPU means
+training and inversion still compete for compute/memory; a separate process does
+not create extra GPU throughput. Shared replay uses `/dev/shm` (roughly 12 GiB
+for the Square defaults); allocation checks available space first.
+
+The `augmentation` CSV/W&B namespace reports submitted/published/pending rows,
+worker compute time, batch count, PID and queue/replay waiting time.
+`aug_worker_timeout=600` bounds queue/drain/startup waits. Successful runs drain
+all submitted transitions; failed workers produce explicit tracebacks.
+Larger `aug_z_num` increases cache memory, insertion-time inversion and training
 critic evaluation cost linearly.
 This requires `noise_chunk_length=-1`. Log `critic/td_loss`, `critic/aug_z_loss`
 and their sum `critic/critic_loss` under `online_agent`. `train_q_sa` additionally trains a separate action-space TD critic with
