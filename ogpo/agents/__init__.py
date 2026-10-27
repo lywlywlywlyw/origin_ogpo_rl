@@ -11,6 +11,7 @@ __all__ = [
     'dsrl',
     'jgcw',
     'grace',
+    'dsrlna',
     'pss',
     'gorl',
     'expo',

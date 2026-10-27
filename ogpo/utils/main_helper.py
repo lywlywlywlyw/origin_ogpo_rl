@@ -85,6 +85,7 @@ def make_vectorized_env(
     seed: Optional[int] = None,
     rew_fn: str = 'sparse',
     post_success_steps: int = 0,
+    env_wrapper=None,
 ) -> AsyncVectorEnv:
     """Create vectorized environment."""
     make_env = get_env_maker(env_name)
@@ -99,6 +100,8 @@ def make_vectorized_env(
             env = make_env(env_name, seed=env_seed, rew_fn=rew_fn)
         else:
             env = make_env(env_name, seed=env_seed, post_success_steps=post_success_steps)
+        if env_wrapper is not None:
+            env = env_wrapper(env)
         return env
 
     vec_env = AsyncVectorEnv(
@@ -337,7 +340,7 @@ def training_log_prefixes(algo_name, online_steps, bc_only=False,
     prefixes = ['eval', 'env', 'offline_agent', 'memory']
     if online_steps > 0 and not bc_only:
         prefixes.append('online_agent')
-        if algo_name in ('dsrl', 'dsrl_bon', 'dsrl_plus_expo', 'pss', 'gorl', 'grace', 'anchorq', 'jgcw'):
+        if algo_name in ('dsrl', 'dsrl_bon', 'dsrl_plus_expo', 'pss', 'gorl', 'grace', 'dsrlna', 'anchorq', 'jgcw'):
             prefixes.append('online_budget')
     if algo_name == 'jgcw' and online_steps > 0 and not bc_only:
         prefixes.append('augmentation')

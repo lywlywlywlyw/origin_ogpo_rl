@@ -47,6 +47,8 @@ from ogpo.agents.jgcw import JGCWAgent
 from ogpo.runners.jgcw_runner import run_jgcw_online_rl
 from ogpo.agents.grace import GRACEAgent, offline_iql_enabled, demo_buffer_enabled
 from ogpo.runners.grace_runner import run_grace_online_rl
+from ogpo.agents.dsrlna import DSRLNAAgent
+from ogpo.runners.dsrlna_runner import run_dsrlna_online_rl
 from ogpo.agents.anchorq import AnchorQAgent
 from ogpo.runners.anchorq_runner import run_anchorq_online_rl
 from ogpo.agents.pss import PSSAgent
@@ -143,6 +145,7 @@ AGENTS = {
     "dsrl": DSRLBestOfNAgent,
     "jgcw": JGCWAgent,
     "grace": GRACEAgent,
+    "dsrlna": DSRLNAAgent,
     "anchorq": AnchorQAgent,
     "dsrl_bon": DSRLBestOfNAgent,
     "pss": PSSAgent,
@@ -174,7 +177,7 @@ def main():
     checkpoint_config = config["checkpoint"]
     agent_config = config_to_agent_dict(config)
 
-    if algo_name in ('pss', 'gorl', 'grace', 'anchorq', 'jgcw'):
+    if algo_name in ('pss', 'gorl', 'grace', 'dsrlna', 'anchorq', 'jgcw'):
         if checkpoint_config.get('resume'):
             raise ValueError(f'{algo_name} requires checkpoint.resume=false')
         if any(train_config[key] for key in
@@ -223,6 +226,12 @@ def main():
         )
 
     del val_dataset  # free immediately to save RAM
+
+    if algo_name == 'dsrlna':
+        if success_buffer_config['use_success_buffer'] or buffer_config['offline_ratio'] != 0:
+            raise ValueError('DSRLNA requires ordinary online replay and no success-buffer BC')
+        if checkpoint_config.get('restore_actor_path') or checkpoint_config.get('restore_critic_path'):
+            raise ValueError('DSRLNA initializes fresh SAC networks; restore only the frozen decoder')
 
     n_eval_envs = eval_config["n_eval_envs"]
     eval_envs = None
@@ -412,8 +421,8 @@ def main():
     # Restore pre-trained weights
     flow_path = checkpoint_config.get('restore_bc_flow_path')
     if not is_resumed and flow_path:
-        if algo_name not in ('dsrl', 'pss', 'gorl', 'grace', 'anchorq', 'jgcw'):
-            raise ValueError('restore_bc_flow_path supports dsrl, pss, gorl, grace, anchorq and jgcw')
+        if algo_name not in ('dsrl', 'pss', 'gorl', 'grace', 'dsrlna', 'anchorq', 'jgcw'):
+            raise ValueError('restore_bc_flow_path supports dsrl, pss, gorl, grace, dsrlna, anchorq and jgcw')
         if train_config['bc_pi_steps'] != 0:
             raise ValueError('Shared BC flow initialization requires training.bc_pi_steps=0')
         agent = agent.restore_bc_flow_params(flow_path)
@@ -687,6 +696,8 @@ def main():
         )
     elif algo_name == 'jgcw':
         agent, log_step, final_eval_info, replay_buffer = run_jgcw_online_rl(**runner_kwargs)
+    elif algo_name == 'dsrlna':
+        agent, log_step, final_eval_info, replay_buffer = run_dsrlna_online_rl(**runner_kwargs)
     elif algo_name == 'grace':
         agent, log_step, final_eval_info, replay_buffer = run_grace_online_rl(**runner_kwargs)
     elif algo_name == 'anchorq':

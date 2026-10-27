@@ -1,0 +1,82 @@
+# DSRL-NA losses with the shared baselines' environment and physical-step budget.
+_base_: common.yaml
+experiment:
+  project: OGPO
+  run_group: square
+  run_name: dsrlna_square_shared_ogpo_bc
+  wandb_name: dsrlna_square_shared_ogpo_bc
+  seed: 1
+  log: true
+  save_dir: exp/ogpo
+env:
+  name: square-mh-low_dim
+  rew_fn: sparse
+  sparse: false
+  post_success_steps: 0
+training:
+  bc_pi_steps: 0
+  bc_q_steps: 0
+  calql_steps: 0
+  q_warmup_steps: 0
+  bc_refine_steps: 0
+  online_steps: 2000000  # Total physical steps, including the update-free warmup.
+  gpu_mode: single
+buffer:
+  size: 2000000
+  start_training: 10000
+  # Per physical step: 1 actor, 1 action-Q, then 0.5 Qz updates (credit carries).
+  utd_online: 1
+  utd_q: 1
+  utd_pi: 1
+  offline_ratio: 0.0
+success_buffer:
+  use_success_buffer: false
+eval:
+  n_eval_envs: 32
+  eval_episodes: 2
+  plot_q_vs_mc: false
+intervals:
+  log_interval: 5000
+  eval_interval: 10000
+  save_interval: 500000
+checkpoint:
+  resume: false
+  restore_bc_flow_path: /root/OGPO_public/exp/ogpo/OGPO/square/square-mh-low_dim/ogpo_squareseed1/params_90000.pkl
+  restore_actor_path: null
+  restore_critic_path: null
+  ep_resume: 90000
+agent:
+  agent_name: dsrlna
+  batch_size: 256
+  actor_hidden_dims: [2048, 2048, 2048]
+  value_hidden_dims: [2048, 2048, 2048]
+  actor_layer_norm: true
+  layer_norm: true
+  # Decoder-only dimensions: must match the OGPO offline checkpoint.
+  decoder_hidden_dims: [512, 512, 512, 512]
+  decoder_layer_norm: false
+  encoder: null
+  actor_obs: state
+  critic_obs: state
+  use_state: proprio
+  num_train_envs: 1
+  num_qs: 2
+  q_agg: min
+  tau: 0.005
+  discount: 0.99  # Per physical step; TD uses discount ** actual chunk length.
+  horizon_length: 4
+  action_chunking: true
+  noise_chunk_length: -1
+  best_of_n: 1
+  noise_critic_updates_per_actor: 0.5  # Reference ratio: 10 student / 20 SAC updates.
+  lr_actor: 0.0003
+  lr_critic: 0.0003
+  lr_noise_critic: 0.0003
+  init_temperature: 1.0
+  target_entropy: 0.0
+  # DSRL-NA's actual z support follows normalized action bounds [-1,1].
+  action_magnitude: 1.0
+  time_embedding: sinusoidal
+  time_embedding_dim: 32
+  flow_steps: 10
+  ft_flow_steps: 10
