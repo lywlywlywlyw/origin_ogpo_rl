@@ -16,7 +16,7 @@ from ogpo.utils.config_loader import load_config, config_to_agent_dict
 @pytest.fixture(scope='module')
 def agent():
     config = config_to_agent_dict(load_config('grace_ogpo_square_shared'))
-    config.update(actor_hidden_dims=(8, 8), value_hidden_dims=(8, 8), num_qs=2,
+    config.update(use_ogpo_trick=False, actor_hidden_dims=(8, 8), value_hidden_dims=(8, 8), num_qs=2,
                   use_layer_norm=False, encoder_sphere_limit=False,
                   use_encoder_clip=False, use_offline_iql=False, use_demo_buffer=False,
                   use_grrl_distill=False, use_faster_distill=True,

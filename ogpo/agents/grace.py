@@ -591,8 +591,34 @@ class GRACEAgent(flax.struct.PyTreeNode):
             latent = dist.sample(seed=rng)
         return self.constrain_actor_output(latent)
 
+    @jax.jit
+    def sample_ogpo_action(self, observations, rng=None):
+        """Return paired (z, a): decode N actor samples, rank by target action Q."""
+        if rng is None:
+            rng = self.rng
+        # vmap preserves both unbatched observations and arbitrary batch axes.
+        keys = jax.random.split(rng, self.config['ogpo_num_samples'])
+        latents = jax.vmap(lambda key: self.sample_noise(observations, key))(keys)
+        actions = jax.vmap(lambda z: self.noise_to_actions_public(
+            observations, z, noises_constrained=True))(latents)
+        scores = jax.vmap(lambda a: jnp.min(
+            self.action_critic_network.select('target_critic')(
+                observations, actions=a), axis=0))(actions)
+        winners = jnp.argmax(scores, axis=0)
+        def select(values):
+            return jnp.take_along_axis(values, winners[None, ..., None], axis=0)[0]
+        return select(latents), select(actions)
+
+    @jax.jit
+    def inverse_ogpo_batch(self, observations, actions):
+        """Reuse JGCW's bounded LM inverse, not GRACE's reverse Euler inverse."""
+        from ogpo.agents.jgcw import JGCWAgent
+        return JGCWAgent.inverse_fm_batch.__wrapped__(self, observations, actions)
+
     @partial(jax.jit, static_argnames=('deterministic',))
     def sample_actions(self, observations, rng=None, deterministic=False):
+        if self.config.get('use_ogpo_trick', False):
+            return self.sample_ogpo_action(observations, rng)[1]
         latent = self.sample_noise(observations, rng, deterministic=deterministic)
         return self.noise_to_actions_public(observations, latent, noises_constrained=True)
 
@@ -740,6 +766,29 @@ class GRACEAgent(flax.struct.PyTreeNode):
     @classmethod
     def create(cls, seed, ex_observations, ex_actions, config):
         config = dict(config)
+        config.setdefault('use_ogpo_trick', False)
+        config.setdefault('ogpo_num_samples', 8)
+        config.setdefault('inverse_fm_batch_size', 32)
+        config.setdefault('inverse_fm_iterations', 16)
+        config.setdefault('inverse_fm_radius', 0.5)
+        if config['use_ogpo_trick']:
+            for key in ('ogpo_num_samples', 'inverse_fm_batch_size', 'inverse_fm_iterations'):
+                value = config[key]
+                if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                    raise ValueError(f'{key} must be a positive integer')
+            radius = config['inverse_fm_radius']
+            if (isinstance(radius, bool) or not isinstance(radius, (int, float))
+                    or not math.isfinite(radius) or radius <= 0):
+                raise ValueError('inverse_fm_radius must be finite and positive')
+            if offline_iql_enabled(config) or demo_buffer_enabled(config):
+                raise ValueError('use_ogpo_trick requires action-Q training and success-buffer BC; '
+                                 'disable offline IQL and demo-buffer mode')
+            if config.get('encoder_sphere_limit', False):
+                raise ValueError('use_ogpo_trick JGCW inversion does not support encoder_sphere_limit')
+            if config.get('encoder') is not None:
+                raise ValueError('use_ogpo_trick JGCW inversion requires pre-encoded observations')
+            if config['noise_chunk_length'] != -1 and config['horizon_length'] != 1:
+                raise ValueError('use_ogpo_trick inversion requires full-chunk noise')
         config.setdefault('use_grrl_distill', False)
         config.setdefault('use_faster_distill', False)
         config.setdefault('faster_distill_num_samples', 8)

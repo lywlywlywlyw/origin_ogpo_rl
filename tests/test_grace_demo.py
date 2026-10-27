@@ -18,7 +18,7 @@ from ogpo.utils.datasets import Dataset
 
 def config():
     return dict(config_to_agent_dict(load_config('grace_ogpo_square_shared')),
-                actor_hidden_dims=(8, 8), value_hidden_dims=(8, 8), use_demo_buffer=True,
+                use_ogpo_trick=False, actor_hidden_dims=(8, 8), value_hidden_dims=(8, 8), use_demo_buffer=True,
                 use_layer_norm=True, use_no_tanh=True, use_offline_iql=False)
 
 

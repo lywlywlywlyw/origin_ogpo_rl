@@ -109,6 +109,55 @@ def _offline_q_chunks(dataset, starts, horizon_length, discount, aggregation):
     ), augmented_rewards.astype(np.float32)
 
 
+def _build_ogpo_success_dataset(agent, dataset, config, seed):
+    """Cache every offline row as a boundary-safe chunk with a JGCW inverse."""
+    from ogpo.runners.grace_iql import with_demo_boundaries
+    dataset = with_demo_boundaries(dataset)
+    if not dataset.size:
+        raise ValueError('use_ogpo_trick requires a nonempty offline dataset')
+    size = config.get('inverse_fm_batch_size', 32)
+    horizon = config['horizon_length'] if config['action_chunking'] else 1
+    output = None
+    for offset in tqdm.trange(0, dataset.size, size, desc='GRACE OGPO JGCW inversion'):
+        starts = np.arange(offset, min(offset + size, dataset.size))
+        chunks, _ = _offline_q_chunks(dataset, starts, horizon, config['discount'],
+                                      config.get('chunk_reward_aggregation', 'max'))
+        # Fixed microbatch shape bounds Jacobian memory and avoids recompilation.
+        count = len(starts)
+        pad = lambda x: np.pad(x, ((0, size - count),) + ((0, 0),) * (x.ndim - 1),
+                               mode='edge')
+        z = np.asarray(agent.inverse_ogpo_batch(
+            pad(chunks['observations']), pad(chunks['true_actions'])))[:count]
+        if not np.isfinite(z).all():
+            raise ValueError(f'Non-finite JGCW inverse latents at offline offset {offset}')
+        chunks['actions'] = z
+        if config.get('chunk_reward_aggregation', 'max') != 'discounted_sum':
+            del chunks['chunk_length']
+        if output is None:
+            output = {k: np.empty((dataset.size, *v.shape[1:]), dtype=v.dtype)
+                      for k, v in chunks.items()}
+        for key, value in chunks.items():
+            output[key][offset:offset + count] = value
+    print(f'GRACE OGPO success pool: cached all {dataset.size} offline chunks (JGCW LM)')
+    return Dataset.create(**output, numpy_rng=np.random.default_rng(seed + 65000))
+
+
+def _sample_ogpo_success_batch(replay, offline, batch_size):
+    """Uniform sampling with replacement over offline + successful online chunks."""
+    online = np.flatnonzero(replay._traj_success_mask[:replay.size])
+    indices = offline.numpy_rng.integers(offline.size + len(online), size=batch_size)
+    is_online = indices >= offline.size
+    result = offline.sample(batch_size, idxs=np.minimum(indices, offline.size - 1))
+    result['is_success'] = np.ones(batch_size, dtype=np.float32)
+    result['score'] = np.ones(batch_size, dtype=np.float32)
+    result = {key: np.asarray(result[key], dtype=replay[key].dtype) for key in replay}
+    if is_online.any():
+        extra = replay.sample(int(is_online.sum()), idxs=online[indices[is_online] - offline.size])
+        for key in result:
+            result[key][is_online] = extra[key]
+    return result
+
+
 def _build_q_pretrain_dataset(agent, dataset, config, batch_size, seed):
     """Invert all offline chunks once and cache all branching augmentations.
 
@@ -234,6 +283,11 @@ def run_grace_online_rl(
     noise as 'actions' and denoised actions as 'true_actions'."""
     assert algo_name in GRACE_ALGORITHMS, f"Expected GRACE algorithm, got {algo_name}"
     assert offline_ratio == 0.0, f"GRACE requires offline_ratio=0.0, got {offline_ratio}"
+    use_ogpo = config.get('use_ogpo_trick', False)
+    if use_ogpo:
+        if demo_buffer_enabled(config) or offline_iql_enabled(config):
+            raise ValueError('use_ogpo_trick is incompatible with demo-buffer mode and offline IQL')
+        use_success_buffer = True
     use_demo = demo_buffer_enabled(config)
     if use_demo:
         if offline_iql_enabled(config):
@@ -333,6 +387,10 @@ def run_grace_online_rl(
         start_step += pretrain_log_steps
         save_agent(agent, save_dir, start_step)
 
+    # Rebuild on resume too: this immutable pool is separate from online replay.
+    offline_success = (_build_ogpo_success_dataset(agent, train_dataset, config, seed)
+                       if use_ogpo else None)
+
     raw_ob, _ = env.reset(seed=seed + 10000)
     ob = _encode_ob(raw_ob)
     action_queue = []
@@ -367,12 +425,15 @@ def run_grace_online_rl(
 
             if len(action_queue) == 0:
                 # Use the same constrained latent actor from the first interaction.
-                noise = agent.sample_noise(observations=ob, rng=key)
-                current_noise = np.array(noise).flatten()
-                if config.get('encoder_sphere_limit', False):
-                    action = agent.noise_to_actions_public(ob, noise, noises_constrained=True)
+                if use_ogpo:
+                    noise, action = agent.sample_ogpo_action(observations=ob, rng=key)
                 else:
-                    action = agent.noise_to_actions_public(ob, noise)
+                    noise = agent.sample_noise(observations=ob, rng=key)
+                    if config.get('encoder_sphere_limit', False):
+                        action = agent.noise_to_actions_public(ob, noise, noises_constrained=True)
+                    else:
+                        action = agent.noise_to_actions_public(ob, noise)
+                current_noise = np.array(noise).flatten()
                 if config.get('decoder_add_noise', False):
                     online_rng, noise_rng = jax.random.split(online_rng)
                     action = agent.add_decoder_noise(action, noise_rng)
@@ -477,7 +538,12 @@ def run_grace_online_rl(
 
             batch_success = None
             success_flag = False
-            if use_success_buffer:
+            if use_ogpo:
+                batch_success = _reshape_for_utd(_sample_ogpo_success_batch(
+                    replay_buffer, offline_success, success_buffer_batch_size * utd_ratio),
+                    utd_ratio, success_buffer_batch_size)
+                success_flag = True
+            elif use_success_buffer:
                 num_successful = replay_buffer._traj_success_mask[:replay_buffer.size].sum()
                 min_success_required = success_buffer_batch_size * utd_ratio
                 if per_env_updates:

@@ -5,10 +5,18 @@ experiment:
   wandb_name: grace_square_shared_ogpo_bc
 agent:
   agent_name: grace
+  # OGPO+: rank decoded actor candidates by min target action-Q; preload all
+  # offline chunks (JGCW bounded LM inverse) into the success sampling pool.
+  # False restores the existing GRACE collection/success-buffer behavior.
+  use_ogpo_trick: true
+  ogpo_num_samples: 8
+  inverse_fm_batch_size: 32
+  inverse_fm_iterations: 16
+  inverse_fm_radius: 0.5
   # FASTER Algorithm 1: N Gaussian z -> latent-Q argmax -> decode only winner;
   # regress Q(s,z*) to stop_gradient(Q(s,decoder(s,z*))) with MSE.
   # Mutually exclusive with use_grrl_distill; inactive in offline-IQL mode.
-  use_faster_distill: true
+  use_faster_distill: false
   faster_distill_num_samples: 8
   # GR-RL Eq. (4): per-sample 50% Gaussian prior + 50% current encoder output.
   # Enables categorical action/latent Q heads; inactive in offline-IQL mode.

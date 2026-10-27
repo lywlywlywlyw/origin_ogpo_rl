@@ -26,7 +26,7 @@ from ogpo.utils.config_loader import load_config, config_to_agent_dict
 
 def make_pair():
     config = config_to_agent_dict(load_config('grace_ogpo_square_shared'))
-    config.update(actor_hidden_dims=(8, 8), value_hidden_dims=(8, 8), num_qs=2,
+    config.update(use_ogpo_trick=False, actor_hidden_dims=(8, 8), value_hidden_dims=(8, 8), num_qs=2,
                   encoder_sphere_limit=True, use_layer_norm=False, use_encoder_clip=False)
     dsrl = DSRLBestOfNAgent.create(1, jnp.zeros(3), jnp.zeros(2), dict(config))
     grace = GRACEAgent.create(1, jnp.zeros(3), jnp.zeros(2), dict(config))
@@ -176,7 +176,7 @@ class GraceTests(unittest.TestCase):
 
     def test_encoder_clip_sampling_losses_and_prior(self):
         config = config_to_agent_dict(load_config('grace_ogpo_square_shared'))
-        config.update(actor_hidden_dims=(8, 8), value_hidden_dims=(8, 8), num_qs=2,
+        config.update(use_ogpo_trick=False, actor_hidden_dims=(8, 8), value_hidden_dims=(8, 8), num_qs=2,
                       use_layer_norm=False, use_encoder_clip=True,
                       encoder_sphere_limit=False, action_magnitude=2.)
         agent = GRACEAgent.create(1, jnp.zeros(3), jnp.zeros(2), config)
@@ -230,7 +230,7 @@ class GraceTests(unittest.TestCase):
 
     def test_encoder_clip_disabled_and_sphere_conflict(self):
         config = config_to_agent_dict(load_config('grace_ogpo_square_shared'))
-        config.update(actor_hidden_dims=(8, 8), value_hidden_dims=(8, 8), num_qs=2,
+        config.update(use_ogpo_trick=False, actor_hidden_dims=(8, 8), value_hidden_dims=(8, 8), num_qs=2,
                       use_layer_norm=False, encoder_sphere_limit=False, use_encoder_clip=False)
         agent = GRACEAgent.create(1, jnp.zeros(3), jnp.zeros(2), config)
         legacy = dict(config)
