@@ -1,6 +1,7 @@
 """DSRL latent TD critic with optional augmentation consistency and action Q.
 
-The action critic is diagnostic: neither the actor nor the latent critic uses it.
+The optional action critic can provide the latent TD bootstrap when enabled.
+The actor always optimizes the latent critic.
 """
 import math
 from typing import Any
@@ -105,7 +106,24 @@ class JGCWAgent(DSRLBestOfNAgent):
         return jax.lax.stop_gradient(latents.reshape(actions.shape[0], count, -1))
 
     def critic_loss(self, batch, grad_params, rng):
-        td_loss, info = super().critic_loss(batch, grad_params, rng)
+        if self.config.get('train_q_sa', False) and self.config.get('use_qa_tdtarget', False):
+            target, next_z, log_probs = self._action_td_target(batch, rng)
+            q = self.critic_network.select('critic')(
+                batch['observations'], actions=batch['actions'], params=grad_params)
+            td_loss = jnp.mean(jnp.square(q - target))
+            info = {
+                'critic_loss': td_loss,
+                'q_mean': q.mean(), 'q_max': q.max(), 'q_min': q.min(),
+                'target_q_mean': target.mean(), 'temp': self.actor_network.select('temp')(),
+                'next_actions_mean': next_z.mean(), 'next_actions_min': next_z.min(),
+                'next_actions_max': next_z.max(), 'next_actions_std': next_z.std(),
+                'rewards_mean': batch['rewards'].mean(),
+                'rewards_min': batch['rewards'].min(), 'rewards_max': batch['rewards'].max(),
+            }
+            if self.config['entropy_backup']:
+                info['next_log_probs_mean'] = jnp.clip(log_probs, -100, 100).mean()
+        else:
+            td_loss, info = super().critic_loss(batch, grad_params, rng)
         if not self.config.get('use_aug_z', False):
             return td_loss, info
 
@@ -133,7 +151,8 @@ class JGCWAgent(DSRLBestOfNAgent):
                             'aug_z_unchanged_fraction': jnp.mean(jnp.all(
                                 z_aug == batch['actions'][:, None, :], axis=-1))}
 
-    def action_critic_loss(self, batch, grad_params, rng):
+    def _action_td_target(self, batch, rng):
+        """Reward + discounted target Qa(s', decoder(s', actor(s'))), detached."""
         # Match DSRL's next latent sample and TD convention exactly.
         _, sample_rng = jax.random.split(rng)
         dist = self.actor_network.select('actor')(batch['next_observations'])
@@ -149,6 +168,10 @@ class JGCWAgent(DSRLBestOfNAgent):
             batch['rewards'] + self.config['discount'] ** batch.get(
                 'chunk_length', self.config['horizon_length']) * batch['masks'] * next_q,
             -500., 500.))
+        return target, next_z, log_probs
+
+    def action_critic_loss(self, batch, grad_params, rng):
+        target, _, _ = self._action_td_target(batch, rng)
         q = self.action_critic_network.select('critic')(
             batch['observations'], actions=batch['true_actions'], params=grad_params)
         loss = jnp.mean(jnp.square(q - target))
@@ -219,6 +242,7 @@ class JGCWAgent(DSRLBestOfNAgent):
         if config['use_aug_z'] and config.get('noise_chunk_length', -1) != -1:
             raise ValueError('use_aug_z requires noise_chunk_length=-1 for full-chunk inverse latents')
         config.setdefault('train_q_sa', False)
+        config.setdefault('use_qa_tdtarget', False)
         config.setdefault('cal_q_accuracy', False)
         if config['cal_q_accuracy'] and not config['train_q_sa']:
             raise ValueError('cal_q_accuracy requires train_q_sa=true')

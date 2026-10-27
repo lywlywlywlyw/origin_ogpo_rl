@@ -27,10 +27,10 @@ from ogpo.utils.q_accuracy import (
 )
 
 
-def make_agent(train=True):
+def make_agent(train=True, qa_tdtarget=False):
     config = config_to_agent_dict(load_config('jgcw_ogpo_square_shared'))
     config.update(actor_hidden_dims=(8, 8), value_hidden_dims=(8, 8), num_qs=2,
-                  train_q_sa=train, cal_q_accuracy=False, cal_action_coverage=False, use_aug_z=False)
+                  train_q_sa=train, use_qa_tdtarget=qa_tdtarget, cal_q_accuracy=False, cal_action_coverage=False, use_aug_z=False)
     return JGCWAgent.create(1, jnp.zeros(3), jnp.zeros(2), config)
 
 
@@ -89,14 +89,91 @@ class IndependentQTests(unittest.TestCase):
             if terminal:
                 np.testing.assert_allclose(info['target_q_mean'], b['rewards'].mean())
 
+    def test_latent_qa_target_matches_action_target_and_ignores_latent_target(self):
+        initial = make_agent(qa_tdtarget=True)
+        batch = jax.tree.map(lambda x: x[0], make_batch())
+        batch = dict(batch, chunk_length=jnp.array([1, 2, 4]), masks=jnp.array([0., 1., 1.]))
+        key = jax.random.PRNGKey(4)
+        for aggregation in ('min', 'mean'):
+            for entropy in (False, True):
+                current = initial.replace(config=dict(initial.config, q_agg=aggregation,
+                                                      entropy_backup=entropy))
+                loss, info = current.critic_loss(batch, current.critic_network.params, key)
+                _, qa_info = current.action_critic_loss(batch, current.action_critic_network.params, key)
+                target, next_z, log_probs = current._action_td_target(batch, key)
+                _, sample_rng = jax.random.split(key)
+                expected_z, expected_log_probs = current.actor_network.select('actor')(
+                    batch['next_observations']).sample_and_log_prob(seed=sample_rng)
+                np.testing.assert_array_equal(next_z, expected_z)
+                next_a = current.noise_to_actions_public(batch['next_observations'], expected_z)
+                qs = current.action_critic_network.select('target_critic')(
+                    batch['next_observations'], actions=next_a)
+                expected = (qs.min(0) if aggregation == 'min' else qs.mean(0))
+                if entropy:
+                    expected -= current.actor_network.select('temp')() * jnp.clip(expected_log_probs, -100, 100)
+                expected = jnp.clip(batch['rewards'] + .99 ** batch['chunk_length'] *
+                                    batch['masks'] * expected, -500., 500.)
+                np.testing.assert_allclose(target, expected, atol=1e-6)
+                self.assertEqual(float(target[0]), float(batch['rewards'][0]))
+                np.testing.assert_array_equal(info['target_q_mean'], qa_info['target_q_mean'])
+                q = current.critic_network.select('critic')(
+                    batch['observations'], actions=batch['actions'])
+                np.testing.assert_allclose(loss, jnp.square(q - expected).mean(), atol=1e-6)
+                params = dict(current.critic_network.params)
+                params['modules_target_critic'] = jax.tree.map(
+                    lambda x: x + 100, params['modules_target_critic'])
+                changed = current.replace(critic_network=current.critic_network.replace(params=params))
+                same, _ = changed.critic_loss(batch, params, key)
+                np.testing.assert_array_equal(loss, same)
+
+    def test_qa_tdtarget_keeps_augmented_consistency_loss(self):
+        current = make_agent(qa_tdtarget=True)
+        batch = jax.tree.map(lambda x: x[0], make_batch())
+        key = jax.random.PRNGKey(12)
+        td, _ = current.critic_loss(batch, current.critic_network.params, key)
+        augmented = current.replace(config=dict(current.config, use_aug_z=True, aug_z_num=2))
+        batch['z_aug'] = jnp.repeat(batch['actions'][:, None], 2, axis=1) + .1
+        loss, info = augmented.critic_loss(batch, augmented.critic_network.params, key)
+        np.testing.assert_array_equal(info['td_loss'], td)
+        np.testing.assert_allclose(loss, td + info['aug_z_loss'], atol=1e-6)
+        self.assertGreater(float(info['aug_z_loss']), 0.)
+
+    def test_qa_target_is_detached_and_flag_is_inactive_without_qa(self):
+        current = make_agent(qa_tdtarget=True)
+        batch = jax.tree.map(lambda x: x[0], make_batch())
+        key = jax.random.PRNGKey(3)
+        def loss_with_qa(params):
+            a = current.replace(action_critic_network=current.action_critic_network.replace(params=params))
+            return a.critic_loss(batch, a.critic_network.params, key)[0]
+        grads = jax.grad(loss_with_qa)(current.action_critic_network.params)
+        for grad in jax.tree.leaves(grads):
+            np.testing.assert_array_equal(grad, jnp.zeros_like(grad))
+        no_qa = make_agent(train=False, qa_tdtarget=True)
+        actual, _ = no_qa.critic_loss(batch, no_qa.critic_network.params, key)
+        expected, _ = DSRLBestOfNAgent.critic_loss(no_qa, batch, no_qa.critic_network.params, key)
+        np.testing.assert_array_equal(actual, expected)
+
+    def test_qa_bootstrap_updates_regular_and_success_paths(self):
+        initial = make_agent(qa_tdtarget=True)
+        batch = jax.tree.map(lambda x: x[:1], make_batch())
+        for success in (None, False, True):
+            updated, info = initial.batch_update(batch, batch if success is not None else None,
+                                                 bool(success))
+            self.assertEqual(int(updated.critic_network.step), int(initial.critic_network.step) + 2)
+            self.assertEqual(int(updated.action_critic_network.step),
+                             int(initial.action_critic_network.step) + 2)
+            self.assertTrue(np.isfinite(info['critic/critic_loss']))
+            assert_equal(self, initial.bc_flow_network, updated.bc_flow_network)
+
     def test_validation_and_shared_config(self):
         config = config_to_agent_dict(load_config('jgcw_ogpo_square_shared'))
         self.assertEqual(config['agent_name'], 'jgcw')
         base = config_to_agent_dict(load_config('jgcw'))
         self.assertEqual(base['agent_name'], 'jgcw')
         self.assertFalse(base['train_q_sa'])
-        self.assertFalse(config['train_q_sa'])
-        self.assertTrue(config['use_aug_z'])
+        self.assertTrue(config['train_q_sa'])
+        self.assertFalse(config['use_qa_tdtarget'])
+        self.assertFalse(config['use_aug_z'])
         self.assertIn('online_budget', training_log_prefixes('jgcw', 100))
         self.assertIn('augmentation', training_log_prefixes('jgcw', 100))
         config.update(train_q_sa=False, cal_q_accuracy=True)
