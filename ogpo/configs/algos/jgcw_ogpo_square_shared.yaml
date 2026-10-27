@@ -23,6 +23,9 @@ agent:
   # Effective only with train_q_sa=true: bootstrap Q(s,z) from target Qa(s',D(s',z')).
   # False preserves latent-Q TD; actor and augmentation losses are unchanged.
   use_qa_tdtarget: true
+  # Effective only when train_q_sa AND use_qa_tdtarget are true.
+  # Add unit-weight MSE from online Qa(s,D(s,z)) to Qz(s,z), z ~ N(0,I).
+  use_qa_distill: true
   cal_q_accuracy: false
   accuracy_s_num: 16          # 4 states from each quarter of successful demonstrations
   accuracy_a_num: 8           # repeated continuations per fixed (s,z,a), not new first actions

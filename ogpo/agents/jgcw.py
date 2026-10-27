@@ -124,8 +124,15 @@ class JGCWAgent(DSRLBestOfNAgent):
                 info['next_log_probs_mean'] = jnp.clip(log_probs, -100, 100).mean()
         else:
             td_loss, info = super().critic_loss(batch, grad_params, rng)
+        total_loss = td_loss
+        if (self.config.get('train_q_sa', False) and self.config.get('use_qa_tdtarget', False)
+                and self.config.get('use_qa_distill', False)):
+            distill_loss, distill_info = self.qa_distillation_loss(
+                batch, grad_params, jax.random.fold_in(rng, 919))
+            total_loss += distill_loss
+            info = {**info, **distill_info, 'td_loss': td_loss, 'critic_loss': total_loss}
         if not self.config.get('use_aug_z', False):
-            return td_loss, info
+            return total_loss, info
 
         if 'z_aug' not in batch:
             raise ValueError('use_aug_z requires cached z_aug in the replay batch')
@@ -143,13 +150,28 @@ class JGCWAgent(DSRLBestOfNAgent):
         q = self.critic_network.select('critic')(
             batch['observations'], actions=batch['actions'], params=grad_params)
         consistency_loss = jnp.mean(jnp.square(q_aug - jax.lax.stop_gradient(q)[..., None]))
-        total_loss = td_loss + consistency_loss
+        total_loss += consistency_loss
         return total_loss, {**info, 'td_loss': td_loss,
                             'aug_z_loss': consistency_loss, 'critic_loss': total_loss,
                             'aug_z_delta_rms': jnp.sqrt(jnp.mean(jnp.square(
                                 z_aug - batch['actions'][:, None, :]))),
                             'aug_z_unchanged_fraction': jnp.mean(jnp.all(
                                 z_aug == batch['actions'][:, None, :], axis=-1))}
+
+    def qa_distillation_loss(self, batch, grad_params, rng):
+        """GRACE-style prior MSE: online Qa ensemble aggregate teaches every Qz head."""
+        noises = jax.random.normal(rng, batch['actions'].shape, dtype=batch['actions'].dtype)
+        actions = self.noise_to_actions_public(batch['observations'], noises)
+        teacher_qs = self.action_critic_network.select('critic')(
+            batch['observations'], actions=actions)
+        target = jax.lax.stop_gradient(
+            teacher_qs.min(axis=0) if self.config['q_agg'] == 'min' else teacher_qs.mean(axis=0))
+        q = self.critic_network.select('critic')(
+            batch['observations'], actions=noises, params=grad_params)
+        loss = jnp.mean(jnp.square(q - target))
+        return loss, {'distillation_loss': loss, 'distill_q_mean': q.mean(),
+                      'distill_target_q_mean': target.mean(),
+                      'distill_noise_mean': noises.mean(), 'distill_noise_std': noises.std()}
 
     def _action_td_target(self, batch, rng):
         """Reward + discounted target Qa(s', decoder(s', actor(s'))), detached."""
@@ -243,6 +265,7 @@ class JGCWAgent(DSRLBestOfNAgent):
             raise ValueError('use_aug_z requires noise_chunk_length=-1 for full-chunk inverse latents')
         config.setdefault('train_q_sa', False)
         config.setdefault('use_qa_tdtarget', False)
+        config.setdefault('use_qa_distill', False)
         config.setdefault('cal_q_accuracy', False)
         if config['cal_q_accuracy'] and not config['train_q_sa']:
             raise ValueError('cal_q_accuracy requires train_q_sa=true')

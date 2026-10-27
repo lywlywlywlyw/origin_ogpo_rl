@@ -27,10 +27,10 @@ from ogpo.utils.q_accuracy import (
 )
 
 
-def make_agent(train=True, qa_tdtarget=False):
+def make_agent(train=True, qa_tdtarget=False, distill=False):
     config = config_to_agent_dict(load_config('jgcw_ogpo_square_shared'))
     config.update(actor_hidden_dims=(8, 8), value_hidden_dims=(8, 8), num_qs=2,
-                  train_q_sa=train, use_qa_tdtarget=qa_tdtarget, cal_q_accuracy=False, cal_action_coverage=False, use_aug_z=False)
+                  train_q_sa=train, use_qa_tdtarget=qa_tdtarget, use_qa_distill=distill, cal_q_accuracy=False, cal_action_coverage=False, use_aug_z=False)
     return JGCWAgent.create(1, jnp.zeros(3), jnp.zeros(2), config)
 
 
@@ -165,6 +165,65 @@ class IndependentQTests(unittest.TestCase):
             self.assertTrue(np.isfinite(info['critic/critic_loss']))
             assert_equal(self, initial.bc_flow_network, updated.bc_flow_network)
 
+    def test_distillation_matches_gaussian_online_teacher_and_student_gradients(self):
+        current = make_agent(qa_tdtarget=True, distill=True)
+        batch = jax.tree.map(lambda x: x[0], make_batch())
+        key = jax.random.PRNGKey(21)
+        distill_key = jax.random.fold_in(key, 919)
+        for aggregation in ('mean', 'min'):
+            a = current.replace(config=dict(current.config, q_agg=aggregation))
+            baseline = a.replace(config=dict(a.config, use_qa_distill=False))
+            td, _ = baseline.critic_loss(batch, baseline.critic_network.params, key)
+            z = jax.random.normal(distill_key, batch['actions'].shape, dtype=batch['actions'].dtype)
+            actions = a.noise_to_actions_public(batch['observations'], z)
+            teacher = a.action_critic_network.select('critic')(batch['observations'], actions=actions)
+            teacher = teacher.mean(0) if aggregation == 'mean' else teacher.min(0)
+            def expected(params):
+                td_value, _ = baseline.critic_loss(batch, params, key)
+                student = a.critic_network.select('critic')(
+                    batch['observations'], actions=z, params=params)
+                return td_value + jnp.mean((student - jax.lax.stop_gradient(teacher)) ** 2)
+            loss, info = a.critic_loss(batch, a.critic_network.params, key)
+            np.testing.assert_allclose(loss, expected(a.critic_network.params), atol=1e-6)
+            np.testing.assert_allclose(loss, td + info['distillation_loss'], atol=1e-6)
+            np.testing.assert_array_equal(info['distill_noise_mean'], z.mean())
+            np.testing.assert_array_equal(info['distill_noise_std'], z.std())
+            actual_grad = jax.grad(lambda p: a.critic_loss(batch, p, key)[0])(a.critic_network.params)
+            expected_grad = jax.grad(expected)(a.critic_network.params)
+            for x, y in zip(jax.tree.leaves(actual_grad), jax.tree.leaves(expected_grad)):
+                np.testing.assert_allclose(x, y, atol=1e-6, rtol=1e-5)
+        def teacher_loss(params):
+            a = current.replace(action_critic_network=current.action_critic_network.replace(params=params))
+            return a.critic_loss(batch, a.critic_network.params, key)[0]
+        for g in jax.tree.leaves(jax.grad(teacher_loss)(current.action_critic_network.params)):
+            np.testing.assert_array_equal(g, jnp.zeros_like(g))
+
+    def test_distillation_requires_both_prerequisites(self):
+        batch = jax.tree.map(lambda x: x[0], make_batch())
+        key = jax.random.PRNGKey(22)
+        for train, target in ((False, False), (False, True), (True, False)):
+            enabled = make_agent(train=train, qa_tdtarget=target, distill=True)
+            disabled = enabled.replace(config=dict(enabled.config, use_qa_distill=False))
+            actual = enabled.critic_loss(batch, enabled.critic_network.params, key)
+            expected = disabled.critic_loss(batch, disabled.critic_network.params, key)
+            assert_equal(self, actual, expected)
+
+    def test_distillation_adds_to_augmentation_and_runs_in_success_updates(self):
+        current = make_agent(qa_tdtarget=True, distill=True)
+        current = current.replace(config=dict(current.config, use_aug_z=True, aug_z_num=2))
+        batch = jax.tree.map(lambda x: x[:1], make_batch())
+        batch['z_aug'] = jnp.repeat(batch['actions'][:, :, None], 2, axis=2) + .1
+        single = jax.tree.map(lambda x: x[0], batch)
+        loss, info = current.critic_loss(single, current.critic_network.params, jax.random.PRNGKey(23))
+        np.testing.assert_allclose(loss, info['td_loss'] + info['distillation_loss'] + info['aug_z_loss'],
+                                   atol=1e-6)
+        for success in (None, False, True):
+            updated, metrics = current.batch_update(batch, batch if success is not None else None,
+                                                    bool(success))
+            self.assertTrue(np.isfinite(metrics['critic/distillation_loss']))
+            self.assertEqual(int(updated.critic_network.step), int(current.critic_network.step) + 2)
+            assert_equal(self, current.bc_flow_network, updated.bc_flow_network)
+
     def test_validation_and_shared_config(self):
         config = config_to_agent_dict(load_config('jgcw_ogpo_square_shared'))
         self.assertEqual(config['agent_name'], 'jgcw')
@@ -172,7 +231,8 @@ class IndependentQTests(unittest.TestCase):
         self.assertEqual(base['agent_name'], 'jgcw')
         self.assertFalse(base['train_q_sa'])
         self.assertTrue(config['train_q_sa'])
-        self.assertFalse(config['use_qa_tdtarget'])
+        self.assertIsInstance(config['use_qa_tdtarget'], bool)
+        self.assertFalse(config['use_qa_distill'])
         self.assertFalse(config['use_aug_z'])
         self.assertIn('online_budget', training_log_prefixes('jgcw', 100))
         self.assertIn('augmentation', training_log_prefixes('jgcw', 100))
