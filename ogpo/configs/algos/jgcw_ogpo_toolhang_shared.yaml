@@ -1,0 +1,41 @@
+# Inherit the matched DSRL run, including its frozen OGPO BC checkpoint.
+_base_: dsrl_ogpo_toolhang_shared.yaml
+experiment:
+  run_name: jgcw_toolhang_shared_ogpo_bc
+  wandb_name: jgcw_toolhang_shared_ogpo_bc
+agent:
+  agent_name: jgcw
+  inverse_fm_iterations: 16  # safeguarded reconstruction solver iterations
+  inverse_fm_radius: 0.5     # maximum L2 distance from the original replay latent
+  inverse_fm_batch_size: 128  # fixed inverse microbatch; bounds Jacobian memory
+  # Augment/invert each completed chunk asynchronously, then publish it to shared replay.
+  # use_aug_z: spawn one frozen-decoder worker; only it writes shared replay.
+  aug_worker_device: auto  # same JAX backend as trainer; cpu or cuda may be explicit
+  aug_worker_cuda_visible_devices: null  # null shares the trainer's visible GPU(s)
+  aug_worker_batch_size: 8  # coalesce queued chunks; bounded power-of-two JIT shapes
+  aug_worker_queue_size: 128  # backpressure, no dropped transitions
+  aug_worker_cpu_count: 4
+  aug_worker_timeout: 600
+  use_aug_z: false
+  aug_z_num: 50              # cached samples per replay chunk; fixed-batch inverse
+  aug_z_sigma: 0.02         # per-coordinate Gaussian standard deviation
+  train_q_sa: true
+  # Effective only with train_q_sa=true: bootstrap Q(s,z) from target Qa(s',D(s',z')).
+  # False preserves latent-Q TD; actor and augmentation losses are unchanged.
+  use_qa_tdtarget: true
+  # Effective only when train_q_sa AND use_qa_tdtarget are true.
+  # Add unit-weight MSE from online Qa(s,D(s,z)) to Qz(s,z), z ~ N(0,I).
+  use_qa_distill: false
+  cal_q_accuracy: false
+  accuracy_s_num: 16          # 4 states from each quarter of successful demonstrations
+  accuracy_a_num: 8           # repeated continuations per fixed (s,z,a), not new first actions
+  accuracy_interval: 100000   # online physical steps; busy evaluations are never queued
+  accuracy_rollout_steps: 1000 # ignore artificial time limits; gamma=.99 tail bound <=.0216
+  accuracy_cpu_count: 2       # separate CPU process; no GPU allocation
+  accuracy_timeout: 3600      # startup/evaluation watchdog, seconds
+
+  cal_action_coverage: false
+  coverage_k: 32
+  coverage_epsilon_a: 0.1     # L2 in executed normalized physical-action coordinates
+  coverage_sample_interval: 1 # evaluate every physical step; retain ALL historical transitions
+  coverage_rebuild_interval: 5000 # exact KNN merges indexed history with all newer points
