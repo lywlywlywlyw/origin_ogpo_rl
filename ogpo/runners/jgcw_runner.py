@@ -409,7 +409,10 @@ def _run_jgcw_online_rl(
             utd_ratio = utd_online * eligible_steps if per_env_updates else utd_online
             if utd_ratio == 0:
                 continue
-            min_required = batch_size * utd_ratio
+            # Matched updates are grouped across the chunk's physical steps.
+            # Replay samples with replacement, so grouping more updates does
+            # not require more distinct rows than a single minibatch.
+            min_required = batch_size if per_env_updates else batch_size * utd_ratio
             if augmentation is not None and replay_buffer.size < min_required:
                 # Wait for submitted initial rows, not for each newest transition.
                 # Never discard eligible updates just because the worker is warming up.
