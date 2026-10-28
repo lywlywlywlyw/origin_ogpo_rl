@@ -8,7 +8,7 @@ agent:
   # OGPO+: rank decoded actor candidates by min target action-Q; preload all
   # offline chunks (JGCW bounded LM inverse) into the success sampling pool.
   # False restores the existing GRACE collection/success-buffer behavior.
-  use_ogpo_trick: true
+  use_ogpo_trick: false
   ogpo_num_samples: 8
   inverse_fm_batch_size: 32
   inverse_fm_iterations: 16
