@@ -20,8 +20,9 @@ agent:
   aug_z_num: 50              # cached samples per replay chunk; fixed-batch inverse
   aug_z_sigma: 0.02         # per-coordinate Gaussian standard deviation
   train_q_sa: true
+  use_vmfer: true  # paper Eq. (9): adaptive, detached gradient-direction weights for SAC; no threshold
   first_train_q: false  # true: all Qa updates -> all Qz updates -> actor (including success-buffer updates)
-  use_klactor_clip: true  # legacy flag name: enforce sampled probability ratios, NOT a KL constraint
+  use_klactor_clip: false  # legacy flag name: enforce sampled probability ratios, NOT a KL constraint
   actor_ratio_clip_epsilon: 0.01  # EVERY fixed SAC sample must have pi_new / pi_old in [0.99, 1.01]
   actor_ratio_clip_max_backtracks: 10  # halve the full Adam step; reject if any sample still violates
   # Effective only with train_q_sa=true: bootstrap Q(s,z) from target Qa(s',D(s',z')).

@@ -29,7 +29,7 @@ from ogpo.utils.q_accuracy import (
 
 def make_agent(train=True, qa_tdtarget=False, distill=False):
     config = config_to_agent_dict(load_config('jgcw_ogpo_square_shared'))
-    config.update(actor_hidden_dims=(8, 8), value_hidden_dims=(8, 8), num_qs=2,
+    config.update(use_vmfer=False, actor_hidden_dims=(8, 8), value_hidden_dims=(8, 8), num_qs=2,
                   train_q_sa=train, use_qa_tdtarget=qa_tdtarget, use_qa_distill=distill,
                   first_train_q=False, use_klactor_clip=False,
                   cal_q_accuracy=False, cal_action_coverage=False, use_aug_z=False)

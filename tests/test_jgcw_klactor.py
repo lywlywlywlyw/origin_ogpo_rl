@@ -15,7 +15,7 @@ from ogpo.utils.config_loader import config_to_agent_dict, load_config
 
 def make_agent(**overrides):
     config = config_to_agent_dict(load_config('jgcw_ogpo_square_shared'))
-    config.update(actor_hidden_dims=(8, 8), value_hidden_dims=(8, 8), num_qs=2,
+    config.update(use_vmfer=False, actor_hidden_dims=(8, 8), value_hidden_dims=(8, 8), num_qs=2,
                   train_q_sa=True, use_qa_tdtarget=True, use_aug_z=False,
                   use_klactor_clip=True, optimizer_actor='adam', lr_actor=.5)
     config.update(overrides)

@@ -30,14 +30,66 @@ class JGCWAgent(DSRLBestOfNAgent):
                 agent.actor_clip_reject_count / jnp.maximum(agent.actor_clip_update_count, 1))}
         return agent, info
 
+    @staticmethod
+    def _vmfer_weights(gradients):
+        """Paper Eq. (9), adapted to the mean-Q objective used by JGCW.
+
+        R * mu is the mean unit direction; x is the actual mean-Q
+        gradient direction. Weights are detached: no second derivatives.
+        Apply within-batch weights rather than maintaining replay priorities.
+        """
+        gradients = jax.lax.stop_gradient(gradients)
+        eps = 1e-8
+        directions = gradients / jnp.maximum(
+            jnp.linalg.norm(gradients, axis=-1, keepdims=True), eps)
+        mean_direction = directions.mean(axis=-2)
+        actual_gradient = gradients.mean(axis=-2)
+        actual_direction = actual_gradient / jnp.maximum(
+            jnp.linalg.norm(actual_gradient, axis=-1, keepdims=True), eps)
+        alignment = jnp.sum(mean_direction * actual_direction, axis=-1)
+        weights = jnp.exp(jnp.clip(alignment, -1., 1.))
+        return jax.lax.stop_gradient(weights), jax.lax.stop_gradient(
+            jnp.linalg.norm(mean_direction, axis=-1))
+
     def actor_loss(self, batch, grad_params, rng):
+        separate_temperature = self.config.get('use_klactor_clip', False)
+        if separate_temperature:
+            grad_params = dict(grad_params)
+            grad_params['modules_temp'] = jax.tree.map(
+                jax.lax.stop_gradient, grad_params['modules_temp'])
+        if self.config.get('use_vmfer', False):
+            _, sample_rng = jax.random.split(rng)
+            dist = self.actor_network.select('actor')(batch['observations'], params=grad_params)
+            z, log_probs = dist.sample_and_log_prob(seed=sample_rng)
+            critic = self.critic_network.select('critic')
+
+            def gradients_one(obs, latent):
+                return jax.jacrev(lambda x: critic(
+                    obs[None], actions=x[None])[:, 0])(latent)
+
+            gradients = jax.vmap(gradients_one)(
+                jax.lax.stop_gradient(batch['observations']), jax.lax.stop_gradient(z))
+            weights, scores = self._vmfer_weights(gradients)
+            q = critic(batch['observations'], actions=z).mean(axis=0)
+            temp = self.actor_network.select('temp')()
+            actor_loss = jnp.mean(weights * (temp * log_probs - q)) / weights.mean()
+            entropy = -jax.lax.stop_gradient(log_probs).mean()
+            temp_param = self.actor_network.select('temp')(params=grad_params)
+            temp_loss = temp_param * (entropy - self.config['target_entropy'])
+            loss = actor_loss + temp_loss
+            info = dict(total_loss=loss, actor_loss=actor_loss, temp_loss=temp_loss,
+                        log_probs_mean=log_probs.mean(), entropy=entropy,
+                        q_actor_mean=q.mean(), temp=temp, actor_mode=dist.mode().mean(),
+                        vmfer_consensus_mean=scores.mean(),
+                        vmfer_consensus_min=scores.min(),
+                        vmfer_weight_mean=weights.mean(),
+                        vmfer_weight_min=weights.min(), vmfer_weight_max=weights.max(),
+                        vmfer_effective_sample_fraction=(weights.mean() ** 2
+                            / jnp.mean(weights ** 2)))
+        else:
+            loss, info = super().actor_loss(batch, grad_params, rng)
         if not self.config.get('use_klactor_clip', False):
-            return super().actor_loss(batch, grad_params, rng)
-        # Temperature has its own optimizer. Keep the original SAC objective.
-        grad_params = dict(grad_params)
-        grad_params['modules_temp'] = jax.tree.map(
-            jax.lax.stop_gradient, grad_params['modules_temp'])
-        loss, info = super().actor_loss(batch, grad_params, rng)
+            return loss, info
         # Reproduce SAC's exact reparameterized draw with its existing seed.
         # Keep the pre-tanh sample: the common bijector cancels from the density
         # ratio, so no inverse-tanh of possibly saturated actions is needed.
@@ -453,6 +505,7 @@ class JGCWAgent(DSRLBestOfNAgent):
         config.setdefault('train_q_sa', False)
         config.setdefault('use_qa_tdtarget', False)
         config.setdefault('first_train_q', False)
+        config.setdefault('use_vmfer', False)
         config.setdefault('use_klactor_clip', False)
         config.setdefault('actor_ratio_clip_epsilon', 0.01)
         config.setdefault('actor_ratio_clip_max_backtracks', 10)
