@@ -189,6 +189,63 @@ class IndependentQTests(unittest.TestCase):
             self.assertTrue(np.isfinite(info['critic/critic_loss']))
             assert_equal(self, initial.bc_flow_network, updated.bc_flow_network)
 
+    def test_first_train_q_updates_critics_before_actor_with_same_budget(self):
+        initial = make_agent(qa_tdtarget=True, distill=True)
+        self.assertFalse(initial.config['first_train_q'])
+        batches = jax.tree.map(lambda x: x[:1], make_batch())
+        successes = dict(batches, rewards=batches['rewards'] + 3.)
+        batch = jax.tree.map(lambda x: x[0], batches)
+        success_batch = jax.tree.map(lambda x: x[0], successes)
+        for count, success in ((1, None), (2, None), (1, False), (1, True),
+                               (2, False), (2, True)):
+            current = initial.replace(config=dict(initial.config, first_train_q=True,
+                                                   critic_updates_per_actor=count))
+            keys = jax.random.split(current.rng, 3 if success is None else 4)
+            new_rng, actor_rng, critic_rng = keys[:3]
+            extra_rng = jax.random.fold_in(critic_rng, 1) if success is None else keys[3]
+            extra = count == 2 or bool(success)
+            chosen = success_batch if success else batch
+            updates = [(batch, critic_rng)] + ([(chosen, extra_rng)] if extra else [])
+
+            # Reference ordering: finish Qa before Qz consumes its targets/teacher.
+            expected = current
+            for data, key in updates:
+                expected, _ = expected._action_step(data, key)
+            for data, key in updates:
+                critic, _ = expected.critic_network.apply_loss_fn(
+                    lambda params: expected.critic_total_loss(data, params, key))
+                expected.target_update(critic, 'critic')
+                expected = expected.replace(critic_network=critic)
+
+            # Actor gradients must use the newly trained Qz, not the old Qz.
+            def actor_loss(params):
+                loss, info = expected.actor_total_loss(batch, params, actor_rng)
+                if success:
+                    loss += expected.actor_bc_loss(success_batch, params, extra_rng)[0]
+                return loss, info
+            actor, expected_info = expected.actor_network.apply_loss_fn(actor_loss)
+            expected = expected.replace(actor_network=actor, rng=new_rng)
+            updated, info = current.batch_update(
+                batches, successes if success is not None else None, bool(success))
+            # Fused JIT and eager reference updates may round float32 differently.
+            for field in ('rng', 'actor_network', 'critic_network', 'action_critic_network',
+                          'bc_flow_network'):
+                actual_leaves = jax.tree.leaves(getattr(updated, field))
+                expected_leaves = jax.tree.leaves(getattr(expected, field))
+                self.assertEqual(len(actual_leaves), len(expected_leaves))
+                for actual, wanted in zip(actual_leaves, expected_leaves):
+                    np.testing.assert_allclose(actual, wanted, rtol=2e-5, atol=2e-7)
+            np.testing.assert_allclose(info['actor/q_actor_mean'],
+                                       expected_info['actor/q_actor_mean'], rtol=2e-5, atol=2e-7)
+            old_info = current.actor_total_loss(batch, current.actor_network.params, actor_rng)[1]
+            self.assertNotAlmostEqual(float(info['actor/q_actor_mean']),
+                                      float(old_info['actor/q_actor_mean']), places=7)
+            self.assertEqual(int(updated.actor_network.step), int(current.actor_network.step) + 1)
+            self.assertEqual(int(updated.critic_network.step),
+                             int(current.critic_network.step) + len(updates))
+            self.assertEqual(int(updated.action_critic_network.step),
+                             int(current.action_critic_network.step) + len(updates))
+
     def test_distillation_matches_gaussian_online_teacher_and_student_gradients(self):
         current = make_agent(qa_tdtarget=True, distill=True)
         batch = jax.tree.map(lambda x: x[0], make_batch())

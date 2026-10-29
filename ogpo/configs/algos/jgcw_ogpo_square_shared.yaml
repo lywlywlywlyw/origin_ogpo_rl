@@ -20,6 +20,7 @@ agent:
   aug_z_num: 50              # cached samples per replay chunk; fixed-batch inverse
   aug_z_sigma: 0.02         # per-coordinate Gaussian standard deviation
   train_q_sa: true
+  first_train_q: true  # true: all Qa updates -> all Qz updates -> actor (including success-buffer updates)
   # Effective only with train_q_sa=true: bootstrap Q(s,z) from target Qa(s',D(s',z')).
   # False preserves latent-Q TD; actor and augmentation losses are unchanged.
   use_qa_tdtarget: true

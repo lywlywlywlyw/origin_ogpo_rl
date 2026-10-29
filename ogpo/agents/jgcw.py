@@ -213,7 +213,49 @@ class JGCWAgent(DSRLBestOfNAgent):
             f'action_critic/{k}': v for k, v in info.items()}
 
     @staticmethod
+    def _update_q_first(agent, batch, success_batch=None, success_flag=False):
+        """Finish all Qa updates, then all Qz updates, then update the actor."""
+        with_bc = success_batch is not None
+        keys = jax.random.split(agent.rng, 4 if with_bc else 3)
+        new_rng, actor_rng, critic_rng = keys[:3]
+        extra_rng = keys[3] if with_bc else jax.random.fold_in(critic_rng, 1)
+
+        agent, action_info = agent._action_step(batch, critic_rng)
+        agent = agent._extra_action_update(
+            agent, batch, success_batch, success_flag, extra_rng)
+
+        critic, critic_info = agent.critic_network.apply_loss_fn(
+            lambda p: agent.critic_total_loss(batch, p, critic_rng))
+        agent.target_update(critic, 'critic')
+        agent = agent.replace(critic_network=critic)
+        agent = DSRLBestOfNAgent._extra_critic_update(
+            agent, batch, success_batch, success_flag, extra_rng)
+
+        def actor_loss_fn(params):
+            loss, info = agent.actor_total_loss(batch, params, actor_rng)
+            if not with_bc:
+                return loss, info
+
+            def add_bc():
+                bc_loss, bc_info = agent.actor_bc_loss(success_batch, params, extra_rng)
+                return loss + bc_loss, {**info, **bc_info}
+
+            def skip_bc():
+                return loss, {**info, **dict.fromkeys((
+                    'actor_bc_loss', 'actor_bc_loss_unweighted',
+                    'actor_noise_mean', 'actor_noise_std',
+                    'successful_noise_mean', 'successful_noise_std', 'bc_mse_error'), 0.0)}
+
+            return jax.lax.cond(success_flag, add_bc, skip_bc)
+
+        actor, actor_info = agent.actor_network.apply_loss_fn(actor_loss_fn)
+        agent = agent.replace(actor_network=actor, rng=new_rng)
+        return agent, {**actor_info, **critic_info, **action_info}
+
+    @staticmethod
     def _update(agent, batch):
+        if agent.config.get('first_train_q', False):
+            return agent._update_q_first(agent, batch)
         _, _, rng2 = jax.random.split(agent.rng, 3)
         agent, action_info = agent._action_step(batch, rng2)
         agent, info = DSRLBestOfNAgent._update(agent, batch)
@@ -221,6 +263,8 @@ class JGCWAgent(DSRLBestOfNAgent):
 
     @staticmethod
     def _update_with_bc(agent, batch_tuple):
+        if agent.config.get('first_train_q', False):
+            return agent._update_q_first(agent, *batch_tuple)
         batch, _, _ = batch_tuple
         _, _, rng2, _ = jax.random.split(agent.rng, 4)
         agent, action_info = agent._action_step(batch, rng2)
@@ -228,7 +272,7 @@ class JGCWAgent(DSRLBestOfNAgent):
         return agent, {**info, **action_info}
 
     @staticmethod
-    def _extra_critic_update(agent, batch, success_batch, success_flag, rng):
+    def _extra_action_update(agent, batch, success_batch, success_flag, rng):
         fixed_extra = agent.config.get('critic_updates_per_actor', 1) == 2
         if agent.action_critic_network is not None and (
                 fixed_extra or agent.config.get('use_success_buffer_q', False)):
@@ -237,6 +281,11 @@ class JGCWAgent(DSRLBestOfNAgent):
                                   lambda: batch)
             agent = jax.lax.cond(jnp.logical_or(fixed_extra, success_flag),
                                  lambda a: a._action_step(chosen, rng)[0], lambda a: a, agent)
+        return agent
+
+    @staticmethod
+    def _extra_critic_update(agent, batch, success_batch, success_flag, rng):
+        agent = agent._extra_action_update(agent, batch, success_batch, success_flag, rng)
         return DSRLBestOfNAgent._extra_critic_update(
             agent, batch, success_batch, success_flag, rng)
 
@@ -269,6 +318,7 @@ class JGCWAgent(DSRLBestOfNAgent):
             raise ValueError('use_aug_z requires noise_chunk_length=-1 for full-chunk inverse latents')
         config.setdefault('train_q_sa', False)
         config.setdefault('use_qa_tdtarget', False)
+        config.setdefault('first_train_q', False)
         config.setdefault('use_no_targetq_clip', False)
         config.setdefault('use_qa_distill', False)
         config.setdefault('cal_q_accuracy', False)
