@@ -126,6 +126,30 @@ class IndependentQTests(unittest.TestCase):
                 same, _ = changed.critic_loss(batch, params, key)
                 np.testing.assert_array_equal(loss, same)
 
+    def test_target_q_clip_switch_covers_latent_and_action_targets(self):
+        batch = jax.tree.map(lambda x: x[0], make_batch())
+        # Terminal rewards isolate both bounds from bootstrap estimates.
+        batch = dict(batch, rewards=jnp.array([-900., 800., -20.]),
+                     masks=jnp.zeros_like(batch['masks']))
+        key = jax.random.PRNGKey(4)
+        for train_qa, qa_tdtarget in ((False, False), (True, False), (True, True)):
+            initial = make_agent(train=train_qa, qa_tdtarget=qa_tdtarget)
+            self.assertFalse(initial.config['use_no_targetq_clip'])
+            for disabled in (False, True):
+                current = initial.replace(config=dict(initial.config, use_no_targetq_clip=disabled))
+                expected = batch['rewards'] if disabled else jnp.clip(batch['rewards'], -500., 500.)
+                loss, info = current.critic_loss(batch, current.critic_network.params, key)
+                q = current.critic_network.select('critic')(
+                    batch['observations'], actions=batch['actions'])
+                np.testing.assert_allclose(loss, jnp.square(q - expected).mean(), rtol=1e-6)
+                np.testing.assert_allclose(info['target_q_mean'], expected.mean())
+                if train_qa:
+                    target, _, _ = current._action_td_target(batch, key)
+                    np.testing.assert_array_equal(target, expected)
+                    _, action_info = current.action_critic_loss(
+                        batch, current.action_critic_network.params, key)
+                    np.testing.assert_allclose(action_info['target_q_mean'], expected.mean())
+
     def test_qa_tdtarget_keeps_augmented_consistency_loss(self):
         current = make_agent(qa_tdtarget=True)
         batch = jax.tree.map(lambda x: x[0], make_batch())

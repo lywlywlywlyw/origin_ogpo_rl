@@ -23,6 +23,7 @@ agent:
   # Effective only with train_q_sa=true: bootstrap Q(s,z) from target Qa(s',D(s',z')).
   # False preserves latent-Q TD; actor and augmentation losses are unchanged.
   use_qa_tdtarget: true
+  use_no_targetq_clip: true  # true disables all JGCW TD target Q clipping
   # Effective only when train_q_sa AND use_qa_tdtarget are true.
   # Add unit-weight MSE from online Qa(s,D(s,z)) to Qz(s,z), z ~ N(0,I).
   use_qa_distill: false

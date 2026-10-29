@@ -105,6 +105,11 @@ class JGCWAgent(DSRLBestOfNAgent):
         latents = latents.reshape(-1, actions.shape[-1])[:targets.shape[0]]
         return jax.lax.stop_gradient(latents.reshape(actions.shape[0], count, -1))
 
+    def _clip_td_target(self, target):
+        if self.config.get('use_no_targetq_clip', False):
+            return target
+        return super()._clip_td_target(target)
+
     def critic_loss(self, batch, grad_params, rng):
         if self.config.get('train_q_sa', False) and self.config.get('use_qa_tdtarget', False):
             target, next_z, log_probs = self._action_td_target(batch, rng)
@@ -186,10 +191,9 @@ class JGCWAgent(DSRLBestOfNAgent):
                   else jnp.mean(next_qs, axis=0))
         if self.config['entropy_backup']:
             next_q -= self.actor_network.select('temp')() * jnp.clip(log_probs, -100, 100)
-        target = jax.lax.stop_gradient(jnp.clip(
-            batch['rewards'] + self.config['discount'] ** batch.get(
-                'chunk_length', self.config['horizon_length']) * batch['masks'] * next_q,
-            -500., 500.))
+        target = batch['rewards'] + self.config['discount'] ** batch.get(
+            'chunk_length', self.config['horizon_length']) * batch['masks'] * next_q
+        target = jax.lax.stop_gradient(self._clip_td_target(target))
         return target, next_z, log_probs
 
     def action_critic_loss(self, batch, grad_params, rng):
@@ -265,6 +269,7 @@ class JGCWAgent(DSRLBestOfNAgent):
             raise ValueError('use_aug_z requires noise_chunk_length=-1 for full-chunk inverse latents')
         config.setdefault('train_q_sa', False)
         config.setdefault('use_qa_tdtarget', False)
+        config.setdefault('use_no_targetq_clip', False)
         config.setdefault('use_qa_distill', False)
         config.setdefault('cal_q_accuracy', False)
         if config['cal_q_accuracy'] and not config['train_q_sa']:

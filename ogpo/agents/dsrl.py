@@ -40,6 +40,9 @@ class DSRLBestOfNAgent(flax.struct.PyTreeNode):
     bc_flow_network: TrainState
     config: Any = nonpytree_field()
 
+    def _clip_td_target(self, target):
+        return jnp.clip(target, -500.0, 500.0)
+
     def critic_loss(self, batch, grad_params, rng):
         rng, sample_rng = jax.random.split(rng)
         next_dist = self.actor_network.select('actor')(batch['next_observations'])
@@ -62,7 +65,7 @@ class DSRLBestOfNAgent(flax.struct.PyTreeNode):
             target_q = batch['rewards'] + \
                 (self.config['discount'] ** batch.get('chunk_length', self.config['horizon_length'])) * batch['masks'] * next_q
 
-        target_q = jnp.clip(target_q, -500.0, 500.0)
+        target_q = self._clip_td_target(target_q)
 
         q = self.critic_network.select('critic')(batch['observations'], actions=batch["actions"], params=grad_params)
         critic_loss = jnp.mean((q - target_q) ** 2)
