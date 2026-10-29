@@ -8,6 +8,7 @@ from typing import Any
 
 import jax
 import jax.numpy as jnp
+import optax
 
 from ogpo.agents.dsrl import DSRLBestOfNAgent
 from ogpo.agents.modules.flax_utils import TrainState
@@ -15,6 +16,140 @@ from ogpo.agents.modules.flax_utils import TrainState
 
 class JGCWAgent(DSRLBestOfNAgent):
     action_critic_network: Any = None
+    temperature_network: Any = None
+    klactor_reference_params: Any = None
+    klactor_reference_initialized: Any = False
+    klactor_update_count: Any = 0
+    klactor_reject_count: Any = 0
+
+    @jax.jit
+    def batch_update(self, batch, batch_success=None, success_flag=False):
+        agent, info = super().batch_update(batch, batch_success, success_flag)
+        if self.config.get('use_klactor_clip', False):
+            # The parent averages scan diagnostics. Report the final running
+            # rejection fraction rather than averaging intermediate fractions.
+            info = {**info, 'actor/rejection_rate': (
+                agent.klactor_reject_count / jnp.maximum(agent.klactor_update_count, 1))}
+        return agent, info
+
+    def actor_loss(self, batch, grad_params, rng):
+        if self.config.get('use_klactor_clip', False):
+            # Temperature has its own optimizer. Preserve the SAC objective and
+            # diagnostics, but exclude temperature gradients from the actor step.
+            grad_params = dict(grad_params)
+            grad_params['modules_temp'] = jax.tree.map(
+                jax.lax.stop_gradient, grad_params['modules_temp'])
+        return super().actor_loss(batch, grad_params, rng)
+
+    def _actor_base_distribution(self, observations, actor_params):
+        params = dict(self.actor_network.params, modules_actor=actor_params)
+        # The shared tanh/rescaling bijection leaves KL invariant.
+        return self.actor_network.select('actor')(observations, params=params).distribution
+
+    @staticmethod
+    def _gaussian_kl(old, new):
+        """Per-state KL(old || new), summed over all latent coordinates."""
+        old_std, new_std = old.stddev(), new.stddev()
+        kl = jnp.sum(jnp.log(new_std) - jnp.log(old_std) + 0.5 * (
+            jnp.square(old_std / new_std)
+            + jnp.square((old.mean() - new.mean()) / new_std) - 1.), axis=-1)
+        return jnp.maximum(kl, 0.)  # roundoff can make equal distributions negative
+
+    def _apply_actor_loss(self, loss_fn, batch):
+        if not self.config.get('use_klactor_clip', False):
+            return super()._apply_actor_loss(loss_fn, batch)
+
+        old_state = self.actor_network
+        candidate, info = old_state.apply_loss_fn(loss_fn)
+        observations = batch['observations']
+        old_params = old_state.params['modules_actor']
+        proposed_params = candidate.params['modules_actor']
+        old_dist = self._actor_base_distribution(observations, old_params)
+
+        def policy_kl(params):
+            return self._gaussian_kl(
+                old_dist, self._actor_base_distribution(observations, params))
+
+        def acceptable(params, kl):
+            finite_params = jnp.all(jnp.stack([
+                jnp.all(jnp.isfinite(x)) for x in jax.tree.leaves(params)]))
+            return (finite_params & jnp.all(jnp.isfinite(kl))
+                    & (kl.mean() <= self.config['klactor_clip_threshold']))
+
+        before_kl = policy_kl(proposed_params)
+
+        def needs_backtrack(carry):
+            steps, _, params, kl = carry
+            return ((steps < self.config['klactor_clip_max_backtracks'])
+                    & ~acceptable(params, kl))
+
+        def backtrack(carry):
+            steps, scale, _, _ = carry
+            scale *= 0.5
+            params = jax.tree.map(
+                lambda old, proposed: old + scale * (proposed - old),
+                old_params, proposed_params)
+            return steps + 1, scale, params, policy_kl(params)
+
+        steps, scale, params, kl = jax.lax.while_loop(
+            needs_backtrack, backtrack,
+            (jnp.int32(0), jnp.float32(1.), proposed_params, before_kl))
+        accepted = acceptable(params, kl)
+        scaled = candidate.replace(params=dict(candidate.params, modules_actor=params))
+        # Accepted backtracking keeps the candidate Adam moments. Full rejection
+        # restores parameters, moments and the actor optimizer's step counter.
+        actor = jax.lax.cond(accepted, lambda: scaled, lambda: old_state)
+        after_kl = jax.lax.cond(accepted, lambda: kl, lambda: jnp.zeros_like(kl))
+
+        # Use the same pre-update actor samples/entropy as the original SAC loss.
+        # Read temperature from actor_network so parameter-only restores are
+        # respected too; temperature optimizer moments remain independent.
+        temperature = self.temperature_network.replace(params={
+            'modules_temp': old_state.params['modules_temp']})
+        entropy_error = jax.lax.stop_gradient(
+            info['actor/entropy'] - self.config['target_entropy'])
+
+        def temperature_loss(p):
+            return temperature.select('temp')(params=p) * entropy_error, {}
+
+        temperature, _ = temperature.apply_loss_fn(temperature_loss)
+        actor = actor.replace(params=dict(
+            actor.params, modules_temp=temperature.params['modules_temp']))
+
+        # Capture after any checkpoint initialization, just before the first
+        # online actor update. The reference then stays fixed (and is saved).
+        reference = jax.lax.cond(
+            self.klactor_reference_initialized,
+            lambda: self.klactor_reference_params, lambda: old_params)
+        new_dist = self._actor_base_distribution(
+            observations, actor.params['modules_actor'])
+        reference_kl = self._gaussian_kl(
+            self._actor_base_distribution(observations, reference), new_dist)
+        count = self.klactor_update_count + 1
+        rejected = (~accepted).astype(jnp.int32)
+        reject_count = self.klactor_reject_count + rejected
+        info = {**info,
+                'actor/kl_before': before_kl.mean(),
+                'actor/kl_before_p95': jnp.quantile(before_kl, .95),
+                'actor/kl_before_p99': jnp.quantile(before_kl, .99),
+                'actor/kl_after': after_kl.mean(),
+                'actor/kl_after_p95': jnp.quantile(after_kl, .95),
+                'actor/kl_after_p99': jnp.quantile(after_kl, .99),
+                'actor/kl_after_max': after_kl.max(),
+                'actor/update_scale': jnp.where(accepted, scale, 0.),
+                'actor/backtrack_steps': steps,
+                'actor/update_rejected': rejected.astype(jnp.float32),
+                'actor/rejection_rate': reject_count / count,
+                'actor/kl_reference': reference_kl.mean(),
+                'actor/kl_reference_p95': jnp.quantile(reference_kl, .95),
+                'actor/kl_reference_p99': jnp.quantile(reference_kl, .99),
+                'actor/pre_tanh_std_mean': new_dist.stddev().mean(),
+                'actor/pre_tanh_std_p95': jnp.quantile(new_dist.stddev(), .95),
+                'actor/temp_after': actor.select('temp')()}
+        return self.replace(
+            temperature_network=temperature, klactor_reference_params=reference,
+            klactor_reference_initialized=jnp.bool_(True),
+            klactor_update_count=count, klactor_reject_count=reject_count), actor, info
 
     @jax.jit
     def inverse_fm_batch(self, observations, actions, initial_latents=None):
@@ -248,7 +383,7 @@ class JGCWAgent(DSRLBestOfNAgent):
 
             return jax.lax.cond(success_flag, add_bc, skip_bc)
 
-        actor, actor_info = agent.actor_network.apply_loss_fn(actor_loss_fn)
+        agent, actor, actor_info = agent._apply_actor_loss(actor_loss_fn, batch)
         agent = agent.replace(actor_network=actor, rng=new_rng)
         return agent, {**actor_info, **critic_info, **action_info}
 
@@ -319,6 +454,16 @@ class JGCWAgent(DSRLBestOfNAgent):
         config.setdefault('train_q_sa', False)
         config.setdefault('use_qa_tdtarget', False)
         config.setdefault('first_train_q', False)
+        config.setdefault('use_klactor_clip', False)
+        config.setdefault('klactor_clip_threshold', 0.01)
+        config.setdefault('klactor_clip_max_backtracks', 10)
+        threshold = config['klactor_clip_threshold']
+        if (isinstance(threshold, bool) or not isinstance(threshold, (int, float))
+                or not math.isfinite(threshold) or threshold <= 0):
+            raise ValueError('klactor_clip_threshold must be finite and positive')
+        backtracks = config['klactor_clip_max_backtracks']
+        if isinstance(backtracks, bool) or not isinstance(backtracks, int) or backtracks < 0:
+            raise ValueError('klactor_clip_max_backtracks must be a nonnegative integer')
         config.setdefault('use_no_targetq_clip', False)
         config.setdefault('use_qa_distill', False)
         config.setdefault('cal_q_accuracy', False)
@@ -339,6 +484,20 @@ class JGCWAgent(DSRLBestOfNAgent):
                                 target_critic=(ex_observations, full_actions))['params']
             params['modules_target_critic'] = params['modules_critic']
             action_state = TrainState.create(model, params, base.critic_network.tx)
-        return cls(rng=base.rng, actor_network=base.actor_network,
+        actor_state = base.actor_network
+        temperature_state = None
+        reference = None
+        if config['use_klactor_clip']:
+            labels = {key: 'actor' if key == 'modules_actor' else 'frozen'
+                      for key in actor_state.params}
+            actor_tx = optax.multi_transform(
+                {'actor': actor_state.tx, 'frozen': optax.set_to_zero()}, labels)
+            temperature_state = TrainState.create(
+                actor_state.model_def, {'modules_temp': actor_state.params['modules_temp']},
+                actor_state.tx)
+            actor_state = TrainState.create(actor_state.model_def, actor_state.params, actor_tx)
+            reference = actor_state.params['modules_actor']
+        return cls(rng=base.rng, actor_network=actor_state,
                    critic_network=base.critic_network, bc_flow_network=base.bc_flow_network,
-                   config=base.config, action_critic_network=action_state)
+                   config=base.config, action_critic_network=action_state,
+                   temperature_network=temperature_state, klactor_reference_params=reference)

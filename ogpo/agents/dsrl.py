@@ -199,13 +199,18 @@ class DSRLBestOfNAgent(flax.struct.PyTreeNode):
             return current.replace(critic_network=state)
         return jax.lax.cond(jnp.logical_or(fixed_extra, success_flag), update, lambda a: a, agent)
 
+    def _apply_actor_loss(self, loss_fn, batch):
+        """Hook for agents that constrain actor updates or track actor state."""
+        actor, info = self.actor_network.apply_loss_fn(loss_fn)
+        return self, actor, info
+
     @staticmethod
     def _update(agent, batch: dict) -> Tuple['DSRLBestOfNAgent', dict]:
         new_rng, rng1, rng2 = jax.random.split(agent.rng, 3)
 
         def actor_loss_fn(p):
             return agent.actor_total_loss(batch, p, rng1)
-        new_actor_state, actor_info = agent.actor_network.apply_loss_fn(actor_loss_fn)
+        agent, new_actor_state, actor_info = agent._apply_actor_loss(actor_loss_fn, batch)
 
         def critic_loss_fn(p):
             return agent.critic_total_loss(batch, p, rng2)
@@ -252,7 +257,7 @@ class DSRLBestOfNAgent(flax.struct.PyTreeNode):
 
             return jax.lax.cond(success_flag, add_bc_loss, no_bc_loss)
 
-        new_actor_state, actor_info = agent.actor_network.apply_loss_fn(actor_loss_fn)
+        agent, new_actor_state, actor_info = agent._apply_actor_loss(actor_loss_fn, batch)
 
         def critic_loss_fn(p):
             return agent.critic_total_loss(batch, p, rng2)

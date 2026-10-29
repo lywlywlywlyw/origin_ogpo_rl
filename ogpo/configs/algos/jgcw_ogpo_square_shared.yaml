@@ -20,7 +20,10 @@ agent:
   aug_z_num: 50              # cached samples per replay chunk; fixed-batch inverse
   aug_z_sigma: 0.02         # per-coordinate Gaussian standard deviation
   train_q_sa: true
-  first_train_q: true  # true: all Qa updates -> all Qz updates -> actor (including success-buffer updates)
+  first_train_q: false  # true: all Qa updates -> all Qz updates -> actor (including success-buffer updates)
+  use_klactor_clip: true  # constrain the complete SAC + success-BC actor update on its ordinary batch
+  klactor_clip_threshold: 0.01  # mean KL(old || new), summed over latent dimensions
+  klactor_clip_max_backtracks: 10  # halve the Adam parameter step; reject if still over threshold
   # Effective only with train_q_sa=true: bootstrap Q(s,z) from target Qa(s',D(s',z')).
   # False preserves latent-Q TD; actor and augmentation losses are unchanged.
   use_qa_tdtarget: true
