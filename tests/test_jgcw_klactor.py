@@ -1,10 +1,9 @@
-"""KL-constrained SAC updates: backtracking, rollback, temperature and scan paths."""
+"""Sampled-ratio actor backtracking under the legacy use_klactor_clip flag."""
 import os
 os.environ.setdefault('JAX_PLATFORMS', 'cpu')
 
 import unittest
 
-import distrax
 import flax.serialization
 import jax
 import jax.numpy as jnp
@@ -39,56 +38,76 @@ def assert_tree_equal(test, left, right):
         np.testing.assert_array_equal(a, b)
 
 
-def bias_loss(params):
-    # A deterministic Adam proposal with a large change in Gaussian means.
-    return -params['modules_actor']['mean_net']['bias'].sum(), {
-        'actor/entropy': jnp.float32(0.)}
+def proposal_loss(agent, batch, gradient_scale=1., samples=None):
+    base = agent._actor_base_distribution(
+        batch['observations'], agent.actor_network.params['modules_actor'])
+    if samples is None:
+        samples = base.sample(seed=jax.random.PRNGKey(17))
+    old_log_probs = base.log_prob(samples)
+
+    def loss(params):
+        return -gradient_scale * params['modules_actor']['mean_net']['bias'].sum(), {
+            'actor/entropy': jnp.float32(0.),
+            'actor/_clip_samples': samples, 'actor/_clip_log_probs': old_log_probs}
+    return loss
 
 
 @jax.jit
-def bias_step(agent, batch):
-    agent, actor, info = agent._apply_actor_loss(bias_loss, batch)
+def bias_step(agent, batch, gradient_scale=1.):
+    agent, actor, info = agent._apply_actor_loss(
+        proposal_loss(agent, batch, gradient_scale), batch)
     return agent.replace(actor_network=actor), info
 
 
-class KLActorTests(unittest.TestCase):
-    def test_analytic_kl_matches_distrax_and_sums_dimensions(self):
-        old = distrax.MultivariateNormalDiag(
-            loc=jnp.array([[0., 1.], [2., -1.]]),
-            scale_diag=jnp.array([[1., 2.], [.5, 1.]]))
-        new = distrax.MultivariateNormalDiag(
-            loc=jnp.array([[.4, 1.2], [1.5, .3]]),
-            scale_diag=jnp.array([[2., 1.], [.7, .8]]))
-        actual = JGCWAgent._gaussian_kl(old, new)
-        np.testing.assert_allclose(actual, old.kl_divergence(new), rtol=1e-6)
-        self.assertEqual(actual.shape, (2,))
-        np.testing.assert_array_equal(JGCWAgent._gaussian_kl(old, old), jnp.zeros(2))
+class RatioActorTests(unittest.TestCase):
+    def test_check_samples_match_sac_draw_and_joint_transformed_ratio(self):
+        agent = make_agent()
+        batch = jax.tree.map(lambda x: x[0], make_batch())
+        key = jax.random.PRNGKey(123)
+        _, info = agent.actor_total_loss(batch, agent.actor_network.params, key)
+        samples = info['actor/_clip_samples']
+        old_log_probs = info['actor/_clip_log_probs']
+        old = agent.actor_network.select('actor')(batch['observations'])
+        _, sample_rng = jax.random.split(key)
+        z, sac_log_probs = old.sample_and_log_prob(seed=sample_rng)
+        np.testing.assert_array_equal(z, old.bijector.forward(samples))
+        np.testing.assert_allclose(old_log_probs, old.distribution.log_prob(samples), atol=1e-6)
+        np.testing.assert_allclose(info['actor/entropy'], -sac_log_probs.mean(), atol=1e-6)
+        params = dict(agent.actor_network.params)
+        actor_params = dict(params['modules_actor'])
+        actor_params['mean_net'] = dict(actor_params['mean_net'], bias=jnp.full(8, .003))
+        params['modules_actor'] = actor_params
+        new = agent.actor_network.select('actor')(batch['observations'], params=params)
+        log_ratio = new.distribution.log_prob(samples) - old_log_probs
+        np.testing.assert_allclose(log_ratio, new.log_prob(z) - old.log_prob(z), atol=5e-6)
+        self.assertEqual(log_ratio.shape, (3,))
 
     def test_full_accept_backtrack_and_rollback_keep_temperature_independent(self):
         batch = jax.tree.map(lambda x: x[0], make_batch())
         initial = make_agent()
-        proposed, _ = initial.actor_network.apply_loss_fn(bias_loss)
         results = []
-        for threshold, backtracks, expected in ((100., 10, 'full'),
-                                               (.01, 10, 'scaled'),
-                                               (.01, 0, 'rejected')):
+        for multiplier, backtracks, expected in ((0., 10, 'full'),
+                                                (1., 10, 'scaled'),
+                                                (1., 0, 'rejected')):
             agent = initial.replace(config=dict(initial.config,
-                klactor_clip_threshold=threshold, klactor_clip_max_backtracks=backtracks))
-            updated, info = bias_step(agent, batch)
+                actor_ratio_clip_max_backtracks=backtracks))
+            proposed, _ = agent.actor_network.apply_loss_fn(proposal_loss(agent, batch, multiplier))
+            updated, info = bias_step(agent, batch, multiplier)
             results.append(updated)
-            self.assertGreater(float(info['actor/kl_before']), .01)
-            self.assertLessEqual(float(info['actor/kl_after']), threshold)
+            self.assertGreaterEqual(float(info['actor/ratio_after_min']), .99 - 1e-7)
+            self.assertLessEqual(float(info['actor/ratio_after_max']), 1.01 + 1e-7)
+            self.assertEqual(float(info['actor/ratio_after_outside_fraction']), 0.)
             self.assertEqual(int(updated.temperature_network.step), 2)
             self.assertNotEqual(float(updated.actor_network.select('temp')()),
                                 float(initial.actor_network.select('temp')()))
-            np.testing.assert_allclose(info['actor/kl_reference'], info['actor/kl_after'],
-                                       rtol=3e-5, atol=2e-7)
+            self.assertFalse(any('/kl_' in key or '_clip_samples' in key for key in info))
             old = initial.actor_network.params['modules_actor']
             new = updated.actor_network.params['modules_actor']
             scale = float(info['actor/update_scale'])
             if expected == 'rejected':
                 self.assertEqual(scale, 0.)
                 self.assertEqual(float(info['actor/rejection_rate']), 1.)
+                self.assertEqual(float(info['actor/ratio_after_min']), 1.)
                 assert_tree_equal(self, new, old)
                 assert_tree_equal(self, updated.actor_network.opt_state,
                                   initial.actor_network.opt_state)
@@ -101,44 +120,83 @@ class KLActorTests(unittest.TestCase):
                 else:
                     self.assertGreater(scale, 0.)
                     self.assertLess(scale, 1.)
-                    self.assertGreater(float(info['actor/backtrack_steps']), 0.)
+                    self.assertGreater(float(info['actor/ratio_before_outside_fraction']), 0.)
                 wanted = jax.tree.map(lambda a, b: a + scale * (b - a),
                                       old, proposed.params['modules_actor'])
                 for a, b in zip(jax.tree.leaves(new), jax.tree.leaves(wanted)):
                     np.testing.assert_allclose(a, b, atol=1e-7)
+                old_dist = initial._actor_base_distribution(batch['observations'], old)
+                samples = old_dist.sample(seed=jax.random.PRNGKey(17))
+                new_dist = updated._actor_base_distribution(batch['observations'], new)
+                ratios = jnp.exp(new_dist.log_prob(samples) - old_dist.log_prob(samples))
+                self.assertTrue(np.all(np.asarray(ratios) >= .99 - 1e-6))
+                self.assertTrue(np.all(np.asarray(ratios) <= 1.01 + 1e-6))
         for result in results[1:]:
             assert_tree_equal(self, result.temperature_network, results[0].temperature_network)
 
-    def test_nonfinite_proposal_is_rejected(self):
-        agent = make_agent(klactor_clip_max_backtracks=2)
+    def test_any_violating_sample_rejects_even_when_mean_ratio_is_inside(self):
+        agent = make_agent(lr_actor=.02, actor_ratio_clip_max_backtracks=0)
         batch = jax.tree.map(lambda x: x[0], make_batch())
-        def loss(params):
-            value, info = bias_loss(params)
-            return value * jnp.nan, info
-        _, actor, info = jax.jit(lambda a: a._apply_actor_loss(loss, batch))(agent)
+        batch = dict(batch, observations=jnp.zeros_like(batch['observations']))
+        samples = jnp.array([[1.] * 8, [-1.] * 8, [0.] * 8])
+        loss_fn = proposal_loss(agent, batch, samples=samples)
+        _, _, info = jax.jit(lambda a: a._apply_actor_loss(loss_fn, batch))(agent)
+        self.assertGreater(float(info['actor/ratio_before_mean']), .99)
+        self.assertLess(float(info['actor/ratio_before_mean']), 1.01)
+        self.assertGreater(float(info['actor/ratio_before_outside_fraction']), 0.)
+        self.assertEqual(float(info['actor/update_rejected']), 1.)
+
+    def test_nonfinite_proposal_is_rejected(self):
+        agent = make_agent(actor_ratio_clip_max_backtracks=2)
+        batch = jax.tree.map(lambda x: x[0], make_batch())
+        _, actor, info = jax.jit(lambda a: a._apply_actor_loss(
+            proposal_loss(a, batch, jnp.nan), batch))(agent)
         self.assertEqual(float(info['actor/update_rejected']), 1.)
         assert_tree_equal(self, actor.params['modules_actor'], agent.actor_network.params['modules_actor'])
         assert_tree_equal(self, actor.opt_state, agent.actor_network.opt_state)
         self.assertTrue(np.isfinite(actor.select('temp')()))
 
-    def test_reference_captures_first_update_and_survives_checkpoint(self):
+    def test_saturated_tanh_and_checkpoint(self):
         initial = make_agent()
         batch = jax.tree.map(lambda x: x[0], make_batch())
-        # Simulate loading actor parameters after create(), before online training.
         params = dict(initial.actor_network.params)
         actor_params = dict(params['modules_actor'])
-        actor_params['mean_net'] = dict(actor_params['mean_net'], bias=jnp.ones(8))
+        actor_params['mean_net'] = dict(actor_params['mean_net'], bias=jnp.full(8, 100.))
         params['modules_actor'] = actor_params
         initial = initial.replace(actor_network=initial.actor_network.replace(params=params))
-        first, _ = bias_step(initial, batch)
-        assert_tree_equal(self, first.klactor_reference_params, actor_params)
-        second, info = bias_step(first, batch)
-        assert_tree_equal(self, second.klactor_reference_params, actor_params)
-        self.assertGreater(float(info['actor/kl_reference']), float(info['actor/kl_after']))
-        restored = flax.serialization.from_state_dict(
-            make_agent(), flax.serialization.to_state_dict(second))
-        assert_tree_equal(self, flax.serialization.to_state_dict(restored),
-                          flax.serialization.to_state_dict(second))
+        np.testing.assert_array_equal(initial.actor_network.select('actor')(
+            batch['observations']).sample(seed=jax.random.PRNGKey(17)), jnp.ones((3, 8)))
+        first, info = bias_step(initial, batch)
+        self.assertTrue(np.isfinite(info['actor/ratio_after_mean']))
+        second, _ = bias_step(first, batch)
+        self.assertEqual(int(second.actor_clip_update_count), 2)
+        state = flax.serialization.to_state_dict(second)
+        self.assertFalse(any('reference' in key for key in state))
+        restored = flax.serialization.from_state_dict(make_agent(), state)
+        assert_tree_equal(self, flax.serialization.to_state_dict(restored), state)
+
+    def test_unchanged_policy_ratio_is_one_with_tiny_std_and_saturated_tanh(self):
+        agent = make_agent()
+        batch = jax.tree.map(lambda x: x[0], make_batch())
+        params = dict(agent.actor_network.params)
+        actor_params = dict(params['modules_actor'])
+        actor_params['mean_net'] = dict(actor_params['mean_net'], bias=jnp.full(8, 100.))
+        actor_params['log_std_net'] = jax.tree.map(
+            jnp.zeros_like, actor_params['log_std_net'])
+        actor_params['log_std_net']['bias'] = jnp.full(8, -20.)
+        params['modules_actor'] = actor_params
+        agent = agent.replace(actor_network=agent.actor_network.replace(params=params))
+
+        def step(a):
+            def zero_loss(p):
+                value, info = a.actor_total_loss(batch, p, jax.random.PRNGKey(123))
+                return value * 0., info
+            return a._apply_actor_loss(zero_loss, batch)
+
+        _, _, info = jax.jit(step)(agent)
+        self.assertEqual(float(info['actor/update_scale']), 1.)
+        self.assertEqual(float(info['actor/ratio_after_min']), 1.)
+        self.assertEqual(float(info['actor/ratio_after_max']), 1.)
 
     def test_rejection_preserves_critic_budget_all_orderings_and_success_paths(self):
         batches = make_batch()
@@ -146,8 +204,7 @@ class KLActorTests(unittest.TestCase):
         for q_first in (False, True):
             for success in (None, False, True):
                 with self.subTest(q_first=q_first, success=success):
-                    initial = make_agent(first_train_q=q_first, klactor_clip_threshold=1e-20,
-                                         klactor_clip_max_backtracks=0,
+                    initial = make_agent(first_train_q=q_first, actor_ratio_clip_max_backtracks=0,
                                          critic_updates_per_actor=2)
                     updated, info = initial.batch_update(
                         batches, successes if success is not None else None, bool(success))
@@ -159,10 +216,9 @@ class KLActorTests(unittest.TestCase):
                     self.assertEqual(int(updated.critic_network.step), 5)
                     self.assertEqual(int(updated.action_critic_network.step), 5)
                     self.assertEqual(int(updated.temperature_network.step), 3)
-                    self.assertEqual(int(updated.klactor_reject_count), 2)
+                    self.assertEqual(int(updated.actor_clip_reject_count), 2)
                     self.assertEqual(float(info['actor/update_rejected']), 1.)
-                    self.assertEqual(float(info['actor/kl_after']), 0.)
-                    self.assertTrue(np.isfinite(info['actor/pre_tanh_std_mean']))
+                    self.assertEqual(float(info['actor/ratio_after_mean']), 1.)
                     if success is True:
                         self.assertGreater(float(info['actor_bc_loss']), 0.)
 
@@ -173,7 +229,7 @@ class KLActorTests(unittest.TestCase):
             for success in (None, True):
                 with self.subTest(q_first=q_first, success=success):
                     enabled = make_agent(first_train_q=q_first, lr_actor=3e-4,
-                                         klactor_clip_threshold=1e6)
+                                         actor_ratio_clip_epsilon=.99)
                     disabled = make_agent(first_train_q=q_first, lr_actor=3e-4,
                                           use_klactor_clip=False)
                     args = (batches, successes if success is not None else None, bool(success))
@@ -181,9 +237,8 @@ class KLActorTests(unittest.TestCase):
                     expected, _ = disabled.batch_update(*args)
                     self.assertEqual(float(info['actor/update_scale']), 1.)
                     for field in ('actor_network', 'critic_network', 'action_critic_network'):
-                        a = getattr(actual, field).params
-                        b = getattr(expected, field).params
-                        for left, right in zip(jax.tree.leaves(a), jax.tree.leaves(b)):
+                        for left, right in zip(jax.tree.leaves(getattr(actual, field).params),
+                                               jax.tree.leaves(getattr(expected, field).params)):
                             np.testing.assert_allclose(left, right, rtol=2e-5, atol=2e-7)
 
 
